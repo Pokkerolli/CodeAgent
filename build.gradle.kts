@@ -8,7 +8,7 @@ plugins {
     id("com.google.devtools.ksp") version "2.2.20-2.0.4"
 }
 
-group = "com.pokkerolli"
+group = "com.pokkerolli.codeagent"
 version = "1.0.0"
 
 kotlin {
@@ -39,7 +39,6 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:3.3.1")
 
     implementation("org.slf4j:slf4j-api:2.0.9")
-    implementation("ch.qos.logback:logback-classic:1.4.11")
 
     testImplementation(kotlin("test"))
 }
@@ -52,7 +51,7 @@ ksp {
 
 compose.desktop {
     application {
-        mainClass = "com.pokkerolli.MainKt"
+        mainClass = "com.pokkerolli.codeagent.MainKt"
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
