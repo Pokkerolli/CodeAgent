@@ -1,0 +1,29 @@
+# IntelliJ IDEA
+.idea/
+*.iml
+out/
+
+# Gradle
+.gradle/
+.gradle-local/
+build/
+
+# Kotlin
+.kotlin/
+
+# Local configuration / secrets
+local.properties
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and JVM crash files
+*.log
+hs_err_pid*
+replay_pid*
+
+# Temporary editor files
+*~
+*.swp
+*.swo
