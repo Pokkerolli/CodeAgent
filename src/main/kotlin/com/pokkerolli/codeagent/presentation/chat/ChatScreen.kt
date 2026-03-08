@@ -32,6 +32,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallSplit
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -67,6 +69,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
 import com.pokkerolli.codeagent.domain.model.MessageRole
+import com.pokkerolli.codeagent.domain.model.TaskStage
 import com.pokkerolli.codeagent.presentation.theme.DeepSeekChatTheme
 import kotlinx.coroutines.flow.distinctUntilChanged
 import org.koin.compose.koinInject
@@ -85,6 +88,7 @@ fun ChatRoute(
         onSessionDeleted = viewModel::onDeleteSession,
         onCreateSession = viewModel::onCreateNewSession,
         onCreateBranchClick = viewModel::onCreateBranchClicked,
+        onTaskPauseResumeClick = viewModel::onTaskPauseResumeClicked,
         onSystemPromptSelected = viewModel::onSystemPromptSelected,
         onUserProfileSelected = viewModel::onUserProfileSelected,
         onOpenCustomProfileBuilder = viewModel::onOpenCustomProfileBuilder,
@@ -107,6 +111,7 @@ private fun ChatScreen(
     onSessionDeleted: (String) -> Unit,
     onCreateSession: () -> Unit,
     onCreateBranchClick: (Long) -> Unit,
+    onTaskPauseResumeClick: () -> Unit,
     onSystemPromptSelected: (String) -> Unit,
     onUserProfileSelected: (String?) -> Unit,
     onOpenCustomProfileBuilder: () -> Unit,
@@ -128,11 +133,13 @@ private fun ChatScreen(
         state.streamingText,
         state.activeSessionId,
         state.isSending,
-        state.isActiveSessionStickyFactsExtractionInProgress
+        state.isActiveSessionStickyFactsExtractionInProgress,
+        state.activeSessionTaskStage
     ) {
         val shouldShowStreamingBubble = state.streamingText.isNotEmpty() ||
             (
                 state.isSending &&
+                    state.activeSessionTaskStage == TaskStage.CONVERSATION &&
                     !state.isActiveSessionStickyFactsExtractionInProgress
                 )
         if (!shouldShowStreamingBubble) {
@@ -141,6 +148,7 @@ private fun ChatScreen(
             state.messages + ChatMessageUi(
                 stableId = "streaming_${state.activeSessionId}",
                 role = MessageRole.ASSISTANT,
+                taskStage = state.activeSessionTaskStage,
                 content = state.streamingText,
                 timestamp = System.currentTimeMillis(),
                 isStreaming = state.isSending &&
@@ -251,7 +259,10 @@ private fun ChatScreen(
             ) {
                 ConversationUsagePanel(
                     usage = state.usage,
-                    isAssistantResponding = state.isSending
+                    isAssistantResponding = state.isSending,
+                    currentTaskStage = state.activeSessionTaskStage,
+                    isTaskPaused = state.activeSessionTaskPaused,
+                    onTaskPauseResumeClick = onTaskPauseResumeClick
                 )
 
                 LazyColumn(
@@ -296,6 +307,9 @@ private fun ChatScreen(
 private fun ConversationUsagePanel(
     usage: ConversationUsageUi,
     isAssistantResponding: Boolean,
+    currentTaskStage: TaskStage,
+    isTaskPaused: Boolean,
+    onTaskPauseResumeClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -308,7 +322,11 @@ private fun ConversationUsagePanel(
                 .padding(horizontal = 12.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
                     text = "Total tokens: ${TokenPricing.formatTokens(usage.contextLength)} (${TokenPricing.formatUsd(usage.cumulativeTotalCostUsd)})",
                     style = MaterialTheme.typography.bodySmall,
@@ -320,6 +338,64 @@ private fun ConversationUsagePanel(
                         strokeWidth = 2.dp
                     )
                 }
+                Spacer(modifier = Modifier.weight(1f))
+
+                if (currentTaskStage != TaskStage.CONVERSATION && (isAssistantResponding || isTaskPaused)) {
+                    TextButton(onClick = onTaskPauseResumeClick) {
+                        Icon(
+                            imageVector = if (isAssistantResponding) {
+                                Icons.Default.Pause
+                            } else {
+                                Icons.Default.PlayArrow
+                            },
+                            contentDescription = null
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(text = if (isAssistantResponding) "Пауза" else "Продолжить")
+                    }
+                }
+            }
+
+            if (currentTaskStage != TaskStage.CONVERSATION) {
+                TaskStageProgress(currentTaskStage = currentTaskStage)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TaskStageProgress(
+    currentTaskStage: TaskStage,
+    modifier: Modifier = Modifier
+) {
+    val sequence = listOf(
+        TaskStage.PLANNING,
+        TaskStage.EXECUTION,
+        TaskStage.VALIDATION,
+        TaskStage.DONE
+    )
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        sequence.forEachIndexed { index, stage ->
+            val isActive = stage == currentTaskStage
+            Text(
+                text = stage.name.lowercase(),
+                style = MaterialTheme.typography.labelMedium,
+                color = if (isActive) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
+            if (index != sequence.lastIndex) {
+                Text(
+                    text = "→",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
@@ -331,10 +407,24 @@ private fun MessageBubble(
     onCreateBranchClick: (Long) -> Unit
 ) {
     val isUser = message.role == MessageRole.USER
-    val bubbleColor = if (isUser) {
-        MaterialTheme.colorScheme.primaryContainer
+    val bubbleColor = if (message.taskStage == TaskStage.CONVERSATION) {
+        if (isUser) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        }
     } else {
-        MaterialTheme.colorScheme.surfaceVariant
+        when (message.taskStage) {
+            TaskStage.PLANNING -> MaterialTheme.colorScheme.tertiaryContainer
+            TaskStage.EXECUTION -> MaterialTheme.colorScheme.secondaryContainer
+            TaskStage.VALIDATION -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.85f)
+            TaskStage.DONE -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.75f)
+            TaskStage.CONVERSATION -> if (isUser) {
+                MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            }
+        }
     }
 
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
@@ -376,7 +466,11 @@ private fun MessageBubble(
                     )
                 }
 
-                if (message.role == MessageRole.ASSISTANT && !message.isStreaming) {
+                if (
+                    message.role == MessageRole.ASSISTANT &&
+                    message.taskStage == TaskStage.CONVERSATION &&
+                    !message.isStreaming
+                ) {
                     TextButton(
                         onClick = {
                             message.sourceMessageId?.let(onCreateBranchClick)
@@ -967,6 +1061,7 @@ private fun ChatScreenPreview() {
                 onSessionDeleted = {},
                 onCreateSession = {},
                 onCreateBranchClick = {},
+                onTaskPauseResumeClick = {},
                 onSystemPromptSelected = {},
                 onUserProfileSelected = {},
                 onOpenCustomProfileBuilder = {},
@@ -1049,6 +1144,7 @@ private fun ChatScreenWithCustomProfileBuilderPreview() {
                 onSessionDeleted = {},
                 onCreateSession = {},
                 onCreateBranchClick = {},
+                onTaskPauseResumeClick = {},
                 onSystemPromptSelected = {},
                 onUserProfileSelected = {},
                 onOpenCustomProfileBuilder = {},

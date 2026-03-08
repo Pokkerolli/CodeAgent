@@ -23,7 +23,9 @@ import com.pokkerolli.codeagent.domain.usecase.GetActiveSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveMessagesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveSessionsUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveUserProfilePresetsUseCase
+import com.pokkerolli.codeagent.domain.usecase.RequestTaskPauseUseCase
 import com.pokkerolli.codeagent.domain.usecase.RunContextSummarizationIfNeededUseCase
+import com.pokkerolli.codeagent.domain.usecase.ResumeTaskStreamingUseCase
 import com.pokkerolli.codeagent.domain.usecase.SendMessageUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetActiveSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionContextWindowModeUseCase
@@ -75,7 +77,9 @@ val databaseModule = module {
                 MIGRATION_11_12,
                 MIGRATION_12_13,
                 MIGRATION_13_14,
-                MIGRATION_14_15
+                MIGRATION_14_15,
+                MIGRATION_15_16,
+                MIGRATION_16_17
             )
             .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
@@ -168,6 +172,8 @@ val useCaseModule = module {
     factory { StreamUserProfileBuilderReplyUseCase(get()) }
     factory { RunContextSummarizationIfNeededUseCase(get()) }
     factory { GetActiveSessionUseCase(get()) }
+    factory { RequestTaskPauseUseCase(get()) }
+    factory { ResumeTaskStreamingUseCase(get()) }
 }
 
 val viewModelModule = module {
@@ -187,7 +193,9 @@ val viewModelModule = module {
             setSessionContextWindowModeUseCase = get(),
             streamUserProfileBuilderReplyUseCase = get(),
             runContextSummarizationIfNeededUseCase = get(),
-            getActiveSessionUseCase = get()
+            getActiveSessionUseCase = get(),
+            requestTaskPauseUseCase = get(),
+            resumeTaskStreamingUseCase = get()
         )
     }
 }
@@ -357,6 +365,43 @@ private val MIGRATION_14_15 = object : Migration(14, 15) {
             )
             """.trimIndent()
         )
+    }
+}
+
+private val MIGRATION_15_16 = object : Migration(15, 16) {
+    override fun migrate(connection: SQLiteConnection) {
+        connection.execSql(
+            "ALTER TABLE chat_sessions " +
+                "ADD COLUMN taskStage TEXT NOT NULL DEFAULT 'CONVERSATION'"
+        )
+        connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskDescription TEXT")
+        connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskPlan TEXT")
+        connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskExecutionReport TEXT")
+        connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskValidationReport TEXT")
+        connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskFinalResult TEXT")
+        connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskReplanReason TEXT")
+        connection.execSql(
+            "ALTER TABLE chat_sessions " +
+                "ADD COLUMN taskAutoReplanCount INTEGER NOT NULL DEFAULT 0"
+        )
+        connection.execSql(
+            "ALTER TABLE chat_messages " +
+                "ADD COLUMN taskStage TEXT NOT NULL DEFAULT 'CONVERSATION'"
+        )
+        connection.execSql(
+            "ALTER TABLE chat_messages " +
+                "ADD COLUMN includeInModelContext INTEGER NOT NULL DEFAULT 1"
+        )
+    }
+}
+
+private val MIGRATION_16_17 = object : Migration(16, 17) {
+    override fun migrate(connection: SQLiteConnection) {
+        connection.execSql(
+            "ALTER TABLE chat_sessions " +
+                "ADD COLUMN isTaskPaused INTEGER NOT NULL DEFAULT 0"
+        )
+        connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskPausedPartialResponse TEXT")
     }
 }
 

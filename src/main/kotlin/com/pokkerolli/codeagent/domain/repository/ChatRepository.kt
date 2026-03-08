@@ -94,4 +94,12 @@ class ChatRepository(
             content = content
         )
     }
+
+    suspend fun requestTaskPause(sessionId: String) {
+        dataSource.requestTaskPause(sessionId)
+    }
+
+    fun resumeTaskStreaming(sessionId: String): Flow<String> {
+        return dataSource.resumeTaskStreaming(sessionId)
+    }
 }

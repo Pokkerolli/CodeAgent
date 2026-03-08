@@ -2,6 +2,7 @@ package com.pokkerolli.codeagent.presentation.chat
 
 import com.pokkerolli.codeagent.domain.model.MessageRole
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
+import com.pokkerolli.codeagent.domain.model.TaskStage
 
 data class ChatSessionUi(
     val id: String,
@@ -11,13 +12,16 @@ data class ChatSessionUi(
     val userProfileName: String?,
     val contextWindowMode: ContextWindowMode,
     val isStickyFactsExtractionInProgress: Boolean,
-    val isContextSummarizationInProgress: Boolean
+    val isContextSummarizationInProgress: Boolean,
+    val taskStage: TaskStage = TaskStage.CONVERSATION,
+    val isTaskPaused: Boolean = false
 )
 
 data class ChatMessageUi(
     val stableId: String,
     val sourceMessageId: Long? = null,
     val role: MessageRole,
+    val taskStage: TaskStage = TaskStage.CONVERSATION,
     val content: String,
     val timestamp: Long,
     val isStreaming: Boolean = false,
@@ -59,6 +63,8 @@ data class ChatUiState(
     val activeSessionContextWindowMode: ContextWindowMode = ContextWindowMode.FULL_HISTORY,
     val isActiveSessionStickyFactsExtractionInProgress: Boolean = false,
     val isActiveSessionContextSummarizationInProgress: Boolean = false,
+    val activeSessionTaskStage: TaskStage = TaskStage.CONVERSATION,
+    val activeSessionTaskPaused: Boolean = false,
     val messages: List<ChatMessageUi> = emptyList(),
     val input: String = "",
     val isSending: Boolean = false,

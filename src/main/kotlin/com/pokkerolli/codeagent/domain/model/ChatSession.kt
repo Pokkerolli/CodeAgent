@@ -11,5 +11,9 @@ data class ChatSession(
     val isStickyFactsExtractionInProgress: Boolean,
     val contextSummary: String?,
     val summarizedMessagesCount: Int,
-    val isContextSummarizationInProgress: Boolean
+    val isContextSummarizationInProgress: Boolean,
+    val taskStage: TaskStage,
+    val taskDescription: String?,
+    val taskFinalResult: String?,
+    val isTaskPaused: Boolean
 )

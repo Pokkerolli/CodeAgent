@@ -4,6 +4,7 @@ data class ChatMessage(
     val id: Long,
     val sessionId: String,
     val role: MessageRole,
+    val taskStage: TaskStage,
     val content: String,
     val timestamp: Long,
     val promptTokens: Int? = null,

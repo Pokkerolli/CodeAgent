@@ -6,6 +6,7 @@ import com.pokkerolli.codeagent.domain.model.ChatMessage
 import com.pokkerolli.codeagent.domain.model.ChatSession
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
 import com.pokkerolli.codeagent.domain.model.MessageRole
+import com.pokkerolli.codeagent.domain.model.TaskStage
 import com.pokkerolli.codeagent.domain.model.UserProfileBuilderMessage
 import com.pokkerolli.codeagent.domain.usecase.CreateCustomUserProfilePresetFromDraftUseCase
 import com.pokkerolli.codeagent.domain.usecase.CreateSessionBranchUseCase
@@ -15,7 +16,9 @@ import com.pokkerolli.codeagent.domain.usecase.GetActiveSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveMessagesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveUserProfilePresetsUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveSessionsUseCase
+import com.pokkerolli.codeagent.domain.usecase.RequestTaskPauseUseCase
 import com.pokkerolli.codeagent.domain.usecase.RunContextSummarizationIfNeededUseCase
+import com.pokkerolli.codeagent.domain.usecase.ResumeTaskStreamingUseCase
 import com.pokkerolli.codeagent.domain.usecase.SendMessageUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetActiveSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionContextWindowModeUseCase
@@ -49,7 +52,9 @@ class ChatViewModel(
     private val setSessionContextWindowModeUseCase: SetSessionContextWindowModeUseCase,
     private val streamUserProfileBuilderReplyUseCase: StreamUserProfileBuilderReplyUseCase,
     private val runContextSummarizationIfNeededUseCase: RunContextSummarizationIfNeededUseCase,
-    private val getActiveSessionUseCase: GetActiveSessionUseCase
+    private val getActiveSessionUseCase: GetActiveSessionUseCase,
+    private val requestTaskPauseUseCase: RequestTaskPauseUseCase,
+    private val resumeTaskStreamingUseCase: ResumeTaskStreamingUseCase
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ChatUiState())
@@ -79,6 +84,15 @@ class ChatViewModel(
         val sessionId = currentState.activeSessionId ?: return
         val userText = currentState.input.trim()
         if (userText.isBlank() || currentState.isSending) return
+        if (
+            currentState.activeSessionTaskPaused &&
+                currentState.activeSessionTaskStage != TaskStage.CONVERSATION
+        ) {
+            _uiState.update {
+                it.copy(errorMessage = "Процесс задачи на паузе. Нажмите «Продолжить».")
+            }
+            return
+        }
 
         _uiState.update {
             it.copy(
@@ -172,6 +186,99 @@ class ChatViewModel(
         cancelCurrentStream()
         viewModelScope.launch {
             setActiveSessionUseCase.execute(sessionId).getOrThrow()
+        }
+    }
+
+    fun onTaskPauseResumeClicked() {
+        val state = _uiState.value
+        val sessionId = state.activeSessionId ?: return
+        val currentStage = state.activeSessionTaskStage
+        if (currentStage == TaskStage.CONVERSATION) return
+
+        if (state.isSending) {
+            viewModelScope.launch {
+                runCatching {
+                    requestTaskPauseUseCase.execute(sessionId).getOrThrow()
+                }.onFailure { throwable ->
+                    _uiState.update {
+                        it.copy(errorMessage = throwable.toUiMessage())
+                    }
+                }
+            }
+            return
+        }
+
+        if (!state.activeSessionTaskPaused) return
+
+        _uiState.update {
+            it.copy(
+                isSending = true,
+                streamingText = "",
+                errorMessage = null
+            )
+        }
+
+        streamJob?.cancel()
+        streamJob = viewModelScope.launch(Dispatchers.IO) {
+            var failed = false
+            try {
+                resumeTaskStreamingUseCase.execute(sessionId).getOrThrow().collect { partial ->
+                    withContext(Dispatchers.Main.immediate) {
+                        _uiState.update { current ->
+                            if (current.activeSessionId == sessionId) {
+                                current.copy(streamingText = partial)
+                            } else {
+                                current
+                            }
+                        }
+                    }
+                }
+            } catch (_: CancellationException) {
+                // Stream was cancelled explicitly (e.g. session switch).
+            } catch (throwable: Throwable) {
+                failed = true
+                withContext(Dispatchers.Main.immediate) {
+                    _uiState.update { current ->
+                        current.copy(
+                            errorMessage = throwable.toUiMessage(),
+                            streamingText = ""
+                        )
+                    }
+                }
+            } finally {
+                withContext(Dispatchers.Main.immediate) {
+                    _uiState.update { current ->
+                        if (current.activeSessionId == sessionId) {
+                            if (failed) {
+                                current.copy(
+                                    isSending = false,
+                                    streamingText = ""
+                                )
+                            } else {
+                                val hasFinalAssistantMessage =
+                                    current.streamingText.isNotEmpty() &&
+                                        current.messages.lastOrNull()?.let { last ->
+                                            last.role == MessageRole.ASSISTANT &&
+                                                isEquivalentAssistantText(last.content, current.streamingText)
+                                        } == true
+                                current.copy(
+                                    isSending = false,
+                                    streamingText = if (hasFinalAssistantMessage) {
+                                        ""
+                                    } else {
+                                        current.streamingText
+                                    }
+                                )
+                            }
+                        } else {
+                            current.copy(
+                                isSending = false,
+                                streamingText = ""
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -484,7 +591,9 @@ class ChatViewModel(
                         userProfileName = it.userProfileName,
                         contextWindowMode = it.contextWindowMode,
                         isStickyFactsExtractionInProgress = it.isStickyFactsExtractionInProgress,
-                        isContextSummarizationInProgress = it.isContextSummarizationInProgress
+                        isContextSummarizationInProgress = it.isContextSummarizationInProgress,
+                        taskStage = it.taskStage,
+                        isTaskPaused = it.isTaskPaused
                     )
                 },
                 activeSessionId = selectedSession?.id,
@@ -496,7 +605,9 @@ class ChatViewModel(
                 isActiveSessionStickyFactsExtractionInProgress =
                     selectedSession?.isStickyFactsExtractionInProgress ?: false,
                 isActiveSessionContextSummarizationInProgress =
-                    selectedSession?.isContextSummarizationInProgress ?: false
+                    selectedSession?.isContextSummarizationInProgress ?: false,
+                activeSessionTaskStage = selectedSession?.taskStage ?: TaskStage.CONVERSATION,
+                activeSessionTaskPaused = selectedSession?.isTaskPaused ?: false
             )
         }
     }
@@ -703,6 +814,7 @@ class ChatViewModel(
             stableId = id.toString(),
             sourceMessageId = id,
             role = role,
+            taskStage = taskStage,
             content = content,
             timestamp = timestamp,
             isStreaming = false,
