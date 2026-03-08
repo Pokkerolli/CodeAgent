@@ -15,5 +15,6 @@ data class ChatSession(
     val taskStage: TaskStage,
     val taskDescription: String?,
     val taskFinalResult: String?,
+    val isInvariantCheckEnabled: Boolean,
     val isTaskPaused: Boolean
 )

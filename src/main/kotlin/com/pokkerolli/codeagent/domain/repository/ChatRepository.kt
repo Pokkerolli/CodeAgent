@@ -4,6 +4,7 @@ import com.pokkerolli.codeagent.domain.datasource.ChatDataSource
 import com.pokkerolli.codeagent.domain.model.ChatMessage
 import com.pokkerolli.codeagent.domain.model.ChatSession
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
+import com.pokkerolli.codeagent.domain.model.InvariantRule
 import com.pokkerolli.codeagent.domain.model.UserProfileBuilderMessage
 import com.pokkerolli.codeagent.domain.model.UserProfilePreset
 import kotlinx.coroutines.flow.Flow
@@ -55,11 +56,22 @@ class ChatRepository(
         )
     }
 
+    suspend fun setSessionInvariantCheckEnabled(sessionId: String, enabled: Boolean) {
+        dataSource.setSessionInvariantCheckEnabled(
+            sessionId = sessionId,
+            enabled = enabled
+        )
+    }
+
     suspend fun setSessionContextWindowMode(sessionId: String, mode: ContextWindowMode) {
         dataSource.setSessionContextWindowMode(
             sessionId = sessionId,
             mode = mode
         )
+    }
+
+    fun observeInvariantRules(): Flow<List<InvariantRule>> {
+        return dataSource.observeInvariantRules()
     }
 
     fun observeUserProfilePresets(): Flow<List<UserProfilePreset>> {

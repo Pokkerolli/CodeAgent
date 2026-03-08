@@ -2,10 +2,12 @@ package com.pokkerolli.codeagent.data.datasource
 import androidx.room.immediateTransaction
 import androidx.room.useWriterConnection
 import com.pokkerolli.codeagent.data.local.dao.MessageDao
+import com.pokkerolli.codeagent.data.local.dao.InvariantRuleDao
 import com.pokkerolli.codeagent.data.local.dao.SessionDao
 import com.pokkerolli.codeagent.data.local.dao.UserProfilePresetDao
 import com.pokkerolli.codeagent.data.local.datastore.ActiveSessionPreferences
 import com.pokkerolli.codeagent.data.local.db.AppDatabase
+import com.pokkerolli.codeagent.data.local.entity.InvariantRuleEntity
 import com.pokkerolli.codeagent.data.local.entity.MessageCompressionState
 import com.pokkerolli.codeagent.data.local.entity.MessageEntity
 import com.pokkerolli.codeagent.data.local.entity.SessionEntity
@@ -22,8 +24,10 @@ import com.pokkerolli.codeagent.domain.datasource.ChatDataSource
 import com.pokkerolli.codeagent.domain.model.ChatMessage
 import com.pokkerolli.codeagent.domain.model.ChatSession
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
+import com.pokkerolli.codeagent.domain.model.InvariantRule
 import com.pokkerolli.codeagent.domain.model.MessageRole
 import com.pokkerolli.codeagent.domain.model.TaskStage
+import com.pokkerolli.codeagent.domain.model.TaskStageTransitionPolicy
 import com.pokkerolli.codeagent.domain.model.USER_PROFILE_PRESETS
 import com.pokkerolli.codeagent.domain.model.UserProfileBuilderMessage
 import com.pokkerolli.codeagent.domain.model.UserProfilePreset
@@ -52,6 +56,7 @@ class ChatDataSourceImpl(
     private val database: AppDatabase,
     private val sessionDao: SessionDao,
     private val messageDao: MessageDao,
+    private val invariantRuleDao: InvariantRuleDao,
     private val userProfilePresetDao: UserProfilePresetDao,
     private val deepSeekApi: DeepSeekApi,
     private val sseStreamParser: SseStreamParser,
@@ -123,6 +128,7 @@ class ChatDataSourceImpl(
             taskFinalResult = sourceSession.taskFinalResult,
             taskReplanReason = sourceSession.taskReplanReason,
             taskAutoReplanCount = sourceSession.taskAutoReplanCount,
+            isInvariantCheckEnabled = sourceSession.isInvariantCheckEnabled,
             isTaskPaused = sourceSession.isTaskPaused,
             taskPausedPartialResponse = sourceSession.taskPausedPartialResponse
         )
@@ -222,6 +228,31 @@ class ChatDataSourceImpl(
         )
     }
 
+    override suspend fun setSessionInvariantCheckEnabled(sessionId: String, enabled: Boolean) {
+        val now = System.currentTimeMillis()
+        ensureDefaultInvariantRules()
+        val existingSession = sessionDao.getSessionById(sessionId)
+
+        if (existingSession == null) {
+            sessionDao.insertSession(
+                SessionEntity(
+                    id = sessionId,
+                    title = DEFAULT_SESSION_TITLE,
+                    createdAt = now,
+                    updatedAt = now,
+                    isInvariantCheckEnabled = enabled
+                )
+            )
+            return
+        }
+
+        sessionDao.updateInvariantCheckEnabled(
+            sessionId = sessionId,
+            enabled = enabled,
+            updatedAt = now
+        )
+    }
+
     override suspend fun setSessionContextWindowMode(sessionId: String, mode: ContextWindowMode) {
         val now = System.currentTimeMillis()
         if (messageDao.getMessagesOnce(sessionId).isNotEmpty()) return
@@ -266,6 +297,191 @@ class ChatDataSourceImpl(
     override fun observeUserProfilePresets(): Flow<List<UserProfilePreset>> {
         return userProfilePresetDao.observeAll().map { customPresets ->
             USER_PROFILE_PRESETS + customPresets.map { it.toDomain() }
+        }
+    }
+
+    override fun observeInvariantRules(): Flow<List<InvariantRule>> = flow {
+        ensureDefaultInvariantRules()
+        invariantRuleDao.observeActiveRules().collect { rules ->
+            emit(rules.map { it.toDomain() })
+        }
+    }
+
+    private suspend fun ensureDefaultInvariantRules() {
+        invariantRuleDao.deleteRulesByKeys(REMOVED_INVARIANT_RULE_KEYS)
+        val existingRuleKeys = invariantRuleDao.getActiveRulesOnce()
+            .map { it.ruleKey }
+            .toSet()
+        if (DEFAULT_INVARIANT_RULE_KEYS.all { it in existingRuleKeys }) return
+        val now = System.currentTimeMillis()
+        invariantRuleDao.insertRules(
+            rules = listOf(
+                InvariantRuleEntity(
+                    ruleKey = INVARIANT_RULE_KEY_KOTLIN_ONLY,
+                    title = "Код только на Kotlin",
+                    description = "Запрещено предлагать или генерировать код на любом языке, кроме Kotlin.",
+                    position = 1,
+                    isActive = true,
+                    createdAt = now,
+                    updatedAt = now
+                ),
+                InvariantRuleEntity(
+                    ruleKey = INVARIANT_RULE_KEY_FUNCTIONS_UNDER_10_LINES,
+                    title = "Функции короче 10 строк",
+                    description = "Каждая функция в коде должна содержать менее 10 строк.",
+                    position = 2,
+                    isActive = true,
+                    createdAt = now,
+                    updatedAt = now
+                )
+            )
+        )
+    }
+
+    private suspend fun runInvariantCheckIfEnabled(
+        session: SessionEntity,
+        validationStage: TaskStage,
+        userInput: String
+    ): InvariantCheckOutcome {
+        if (!session.isInvariantCheckEnabled) return InvariantCheckOutcome.allowed()
+
+        val normalizedInput = userInput.trim()
+        if (normalizedInput.isEmpty()) return InvariantCheckOutcome.allowed()
+
+        ensureDefaultInvariantRules()
+        val activeRules = invariantRuleDao.getActiveRulesOnce()
+        if (activeRules.isEmpty()) return InvariantCheckOutcome.allowed()
+        val knownRuleKeys = activeRules
+            .map { it.ruleKey }
+            .toSet()
+
+        val request = ChatCompletionRequest(
+            model = DEFAULT_MODEL,
+            messages = listOf(
+                ChatCompletionMessage(
+                    role = SYSTEM_ROLE,
+                    content = buildInvariantValidationSystemPrompt(activeRules)
+                ),
+                ChatCompletionMessage(
+                    role = USER_ROLE,
+                    content = buildInvariantValidationPayload(
+                        validationStage = validationStage,
+                        userInput = normalizedInput
+                    )
+                )
+            ),
+            stream = false
+        )
+
+        val response = deepSeekApi.chatCompletions(request)
+        val body = response.body
+
+        if (!response.isSuccessful || body == null) {
+            throw ChatApiException(
+                buildApiErrorMessage(
+                    code = response.code,
+                    rawError = response.rawError
+                )
+            )
+        }
+
+        val rawValidatorReply = body.choices
+            .firstOrNull()
+            ?.message
+            ?.content
+            ?.trim()
+            .orEmpty()
+
+        val resultMatch = INVARIANT_RESULT_REGEX.find(rawValidatorReply)
+        val normalizedResult = resultMatch
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            ?.lowercase()
+
+        return when (normalizedResult) {
+            "true" -> InvariantCheckOutcome.allowed()
+            "false" -> {
+                val violatedInvariantKeys = extractViolatedInvariantKeys(
+                    rawValidatorReply = rawValidatorReply,
+                    knownRuleKeys = knownRuleKeys
+                )
+                if (violatedInvariantKeys.isEmpty()) {
+                    return InvariantCheckOutcome.allowed()
+                }
+                val reasonText = rawValidatorReply
+                    .replace(INVARIANT_RESULT_LINE_REGEX, "")
+                    .replace(INVARIANT_VIOLATED_LINE_REGEX, "")
+                    .trim()
+                    .ifEmpty { "Причина не указана." }
+                InvariantCheckOutcome.rejected(
+                    messageForUser = buildString {
+                        append("Запрос отклонён: нарушены инварианты.\n")
+                        append(reasonText)
+                    }
+                )
+            }
+
+            else -> {
+                InvariantCheckOutcome.allowed()
+            }
+        }
+    }
+
+    private fun buildInvariantValidationSystemPrompt(rules: List<InvariantRuleEntity>): String {
+        val rulesBlock = rules.joinToString(separator = "\n") { rule ->
+            "- [${rule.ruleKey}] ${rule.title}: ${rule.description}"
+        }
+        return buildString {
+            appendLine(INVARIANT_VALIDATION_BASE_PROMPT)
+            appendLine()
+            appendLine("ИНВАРИАНТЫ:")
+            appendLine(rulesBlock)
+            appendLine()
+            appendLine("ФОРМАТ ОТВЕТА (ОБЯЗАТЕЛЬНО):")
+            appendLine("RESULT=[true] или RESULT=[false]")
+            appendLine("VIOLATED_INVARIANTS: <rule_key через запятую или NONE>")
+            appendLine("REASON: <краткое объяснение>")
+            appendLine("ALTERNATIVE: <безопасная альтернатива, если RESULT=[false]>")
+        }.trim()
+    }
+
+    private fun extractViolatedInvariantKeys(
+        rawValidatorReply: String,
+        knownRuleKeys: Set<String>
+    ): Set<String> {
+        val rawLinePayload = INVARIANT_VIOLATED_KEYS_REGEX
+            .find(rawValidatorReply)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            .orEmpty()
+        if (rawLinePayload.isEmpty()) return emptySet()
+
+        val normalizedPayload = rawLinePayload
+            .removePrefix("[")
+            .removeSuffix("]")
+            .trim()
+        if (normalizedPayload.equals("NONE", ignoreCase = true)) return emptySet()
+
+        return normalizedPayload
+            .split(Regex("[,;\\s]+"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .filter { it in knownRuleKeys }
+            .toSet()
+    }
+
+    private fun buildInvariantValidationPayload(
+        validationStage: TaskStage,
+        userInput: String
+    ): String {
+        return buildString {
+            append("STAGE:\n")
+            append(validationStage.name)
+            append("\n\n")
+            append("USER_MESSAGE:\n")
+            append(userInput)
         }
     }
 
@@ -521,6 +737,33 @@ class ChatDataSourceImpl(
                 return@flow
             }
 
+            if (currentTaskStage == TaskStage.CONVERSATION) {
+                val invariantCheck = runInvariantCheckIfEnabled(
+                    session = sessionSnapshot,
+                    validationStage = TaskStage.CONVERSATION,
+                    userInput = cleanedContent
+                )
+                if (!invariantCheck.allowed) {
+                    val rejectReply = invariantCheck.messageForUser
+                    val doneTimestamp = System.currentTimeMillis()
+                    database.withTransactionCompat {
+                        messageDao.insertMessage(
+                            MessageEntity(
+                                sessionId = sessionId,
+                                role = MessageRole.ASSISTANT.name,
+                                taskStage = currentTaskStage.name,
+                                includeInModelContext = true,
+                                content = rejectReply,
+                                createdAt = doneTimestamp
+                            )
+                        )
+                        sessionDao.touchSession(sessionId, doneTimestamp)
+                    }
+                    emit(rejectReply)
+                    return@flow
+                }
+            }
+
             val allMessages = messageDao.getMessagesOnce(sessionId)
             val modelMessages = allMessages.filterControlCommandMessagesForModelContext()
             val contextMode = ContextWindowMode.fromStored(sessionSnapshot.contextWindowMode)
@@ -707,8 +950,7 @@ class ChatDataSourceImpl(
     ): List<ChatCompletionMessage> {
         val contextMode = ContextWindowMode.fromStored(session.contextWindowMode)
         if (allMessages.isEmpty()) return emptyList()
-
-        return when (contextMode) {
+        val baseMessages = when (contextMode) {
             ContextWindowMode.FULL_HISTORY -> allMessages.toApiMessages()
             ContextWindowMode.SLIDING_WINDOW_LAST_10 -> {
                 val currentRequest = allMessages.last()
@@ -727,6 +969,40 @@ class ChatDataSourceImpl(
                 allMessages = allMessages
             )
         }
+        if (baseMessages.isEmpty()) return emptyList()
+
+        val invariantContextMessage = buildInvariantContextMessage(session)
+        return if (invariantContextMessage == null) {
+            baseMessages
+        } else {
+            listOf(invariantContextMessage) + baseMessages
+        }
+    }
+
+    private suspend fun buildInvariantContextMessage(session: SessionEntity): ChatCompletionMessage? {
+        if (!session.isInvariantCheckEnabled) return null
+
+        ensureDefaultInvariantRules()
+        val activeRules = invariantRuleDao.getActiveRulesOnce()
+            .sortedBy { it.position }
+        if (activeRules.isEmpty()) return null
+
+        val rulesBlock = activeRules.joinToString(separator = "\n") { rule ->
+            "- [${rule.ruleKey}] ${rule.title}: ${rule.description}"
+        }
+
+        val prompt = buildString {
+            appendLine("[INVARIANTS]")
+            appendLine("Эти ограничения обязательны в каждом ответе:")
+            appendLine(rulesBlock)
+            appendLine()
+            appendLine("Если запрос конфликтует с инвариантами, откажитесь от нарушающей части и предложите корректную альтернативу.")
+        }.trim()
+
+        return ChatCompletionMessage(
+            role = SYSTEM_ROLE,
+            content = prompt
+        )
     }
 
     private fun buildStickyFactsContextMessages(
@@ -1312,6 +1588,16 @@ class ChatDataSourceImpl(
                     return singleMessageOutcome(stage, reply)
                 }
 
+                val invariantCheck = runInvariantCheckIfEnabled(
+                    session = session,
+                    validationStage = TaskStage.PLANNING,
+                    userInput = command.description
+                )
+                if (!invariantCheck.allowed) {
+                    emitPartial(invariantCheck.messageForUser)
+                    return singleMessageOutcome(stage, invariantCheck.messageForUser)
+                }
+
                 val planningSession = persistTaskSessionState(
                     transitionTaskStage(
                         session = session.copy(
@@ -1333,6 +1619,7 @@ class ChatDataSourceImpl(
                 val generatedPlan = try {
                     requestTaskPlanning(
                         sessionId = sessionId,
+                        session = planningSession,
                         taskDescription = planningSession.taskDescription.orEmpty(),
                         userProfilePayload = userProfilePayload,
                         replanReason = null,
@@ -1456,6 +1743,16 @@ class ChatDataSourceImpl(
                     }
                 val userProfilePayload = resolveUserProfilePayload(session.userProfileName)
 
+                val invariantCheck = runInvariantCheckIfEnabled(
+                    session = session,
+                    validationStage = TaskStage.PLANNING,
+                    userInput = command.reason
+                )
+                if (!invariantCheck.allowed) {
+                    emitPartial(invariantCheck.messageForUser)
+                    return singleMessageOutcome(stage, invariantCheck.messageForUser)
+                }
+
                 val planningSession = persistTaskSessionState(
                     transitionTaskStage(
                         session = session.copy(
@@ -1470,6 +1767,7 @@ class ChatDataSourceImpl(
                 val replanned = try {
                     requestTaskPlanning(
                         sessionId = sessionId,
+                        session = planningSession,
                         taskDescription = taskDescription,
                         userProfilePayload = userProfilePayload,
                         replanReason = command.reason,
@@ -1521,6 +1819,16 @@ class ChatDataSourceImpl(
                     }
                 val userProfilePayload = resolveUserProfilePayload(session.userProfileName)
 
+                val invariantCheck = runInvariantCheckIfEnabled(
+                    session = session,
+                    validationStage = TaskStage.PLANNING,
+                    userInput = command.reason
+                )
+                if (!invariantCheck.allowed) {
+                    emitPartial(invariantCheck.messageForUser)
+                    return singleMessageOutcome(stage, invariantCheck.messageForUser)
+                }
+
                 val planningSession = persistTaskSessionState(
                     transitionTaskStage(
                         session = session.copy(
@@ -1535,6 +1843,7 @@ class ChatDataSourceImpl(
                 val replanned = try {
                     requestTaskPlanning(
                         sessionId = sessionId,
+                        session = planningSession,
                         taskDescription = taskDescription,
                         userProfilePayload = userProfilePayload,
                         replanReason = command.reason,
@@ -1586,13 +1895,7 @@ class ChatDataSourceImpl(
     }
 
     private fun isTaskTransitionAllowed(current: TaskStage, target: TaskStage): Boolean {
-        return when (current) {
-            TaskStage.CONVERSATION -> target == TaskStage.PLANNING
-            TaskStage.PLANNING -> target == TaskStage.PLANNING || target == TaskStage.EXECUTION
-            TaskStage.EXECUTION -> target == TaskStage.VALIDATION
-            TaskStage.VALIDATION -> target == TaskStage.DONE || target == TaskStage.PLANNING
-            TaskStage.DONE -> target == TaskStage.CONVERSATION || target == TaskStage.PLANNING
-        }
+        return TaskStageTransitionPolicy.isAllowed(current = current, target = target)
     }
 
     private fun clearTaskPauseState(session: SessionEntity): SessionEntity {
@@ -1692,6 +1995,7 @@ class ChatDataSourceImpl(
                 val generatedPlan = try {
                     requestTaskPlanning(
                         sessionId = resumedSession.id,
+                        session = resumedSession,
                         taskDescription = taskDescription,
                         userProfilePayload = userProfilePayload,
                         replanReason = resumedSession.taskReplanReason,
@@ -1839,6 +2143,7 @@ class ChatDataSourceImpl(
         val executionReport = try {
             requestTaskExecution(
                 sessionId = sessionId,
+                session = executionStageSession,
                 taskDescription = taskDescription,
                 approvedPlan = approvedPlan,
                 userProfilePayload = userProfilePayload,
@@ -1902,6 +2207,7 @@ class ChatDataSourceImpl(
         val validationReport = try {
             requestTaskValidation(
                 sessionId = sessionId,
+                session = validationStageSession,
                 taskDescription = taskDescription,
                 approvedPlan = approvedPlan,
                 executionReport = executionReport,
@@ -1918,29 +2224,38 @@ class ChatDataSourceImpl(
                 partialResponse = paused.partialResponse
             )
         }
+        val executionFinalResult = extractExecutionFinalResult(executionReport)
+        val localCodeIssue = buildFinalResultCodeValidationIssue(executionFinalResult)
+        val effectiveValidationReport = appendLocalValidationGuard(
+            validationReport = validationReport,
+            localIssue = localCodeIssue
+        )
         val withValidation = clearTaskPauseState(validationStageSession).copy(
             taskExecutionReport = executionReport,
-            taskValidationReport = validationReport
+            taskValidationReport = effectiveValidationReport
         )
         val validationMessage = StageAssistantMessage(
             stage = TaskStage.VALIDATION,
-            content = validationReport
+            content = effectiveValidationReport
         )
 
-        val decision = parseValidationDecision(validationReport)
+        val decision = if (localCodeIssue != null) {
+            ValidationDecision.REPLAN_REQUIRED
+        } else {
+            parseValidationDecision(effectiveValidationReport)
+        }
         if (decision == ValidationDecision.SUCCESS) {
-            val finalResult = extractExecutionFinalResult(executionReport)
             val doneSession = persistTaskSessionState(
                 transitionTaskStage(
                     session = withValidation.copy(
-                        taskFinalResult = finalResult,
+                        taskFinalResult = executionFinalResult,
                         taskReplanReason = null,
                         taskAutoReplanCount = 0
                     ),
                     target = TaskStage.DONE
                 )
             )
-            val doneReply = buildDoneStageReply(finalResult = finalResult)
+            val doneReply = buildDoneStageReply(finalResult = executionFinalResult)
             if (isTaskPauseRequested(sessionId)) {
                 return buildPausedTaskOutcome(
                     session = doneSession,
@@ -1962,7 +2277,10 @@ class ChatDataSourceImpl(
             )
         }
 
-        val issues = extractValidationIssues(validationReport)
+        val issues = mergeValidationIssues(
+            modelIssues = extractValidationIssues(effectiveValidationReport),
+            localIssue = localCodeIssue
+        )
             ?: DEFAULT_VALIDATION_REPLAN_REASON
         val attempts = withValidation.taskAutoReplanCount + 1
         if (attempts >= MAX_TASK_AUTO_REPLAN_ATTEMPTS) {
@@ -2012,6 +2330,7 @@ class ChatDataSourceImpl(
         val replanned = try {
             requestTaskPlanning(
                 sessionId = sessionId,
+                session = planningStageSession,
                 taskDescription = taskDescription,
                 userProfilePayload = userProfilePayload,
                 replanReason = issues,
@@ -2048,6 +2367,7 @@ class ChatDataSourceImpl(
 
     private suspend fun requestTaskPlanning(
         sessionId: String,
+        session: SessionEntity,
         taskDescription: String,
         userProfilePayload: String?,
         replanReason: String?,
@@ -2060,18 +2380,21 @@ class ChatDataSourceImpl(
             replanReason = replanReason,
             partialResponseSoFar = partialResponseSoFar
         )
+        val invariantMessage = buildInvariantContextMessage(session)
         return requestSingleAssistantMessageStreaming(
             sessionId = sessionId,
             stage = TaskStage.PLANNING,
             systemPrompt = TASK_PLANNING_SYSTEM_PROMPT,
             userPayload = payload,
             partialResponseSoFar = partialResponseSoFar,
+            additionalSystemMessages = listOfNotNull(invariantMessage),
             emitPartial = emitPartial
         )
     }
 
     private suspend fun requestTaskExecution(
         sessionId: String,
+        session: SessionEntity,
         taskDescription: String,
         approvedPlan: String,
         userProfilePayload: String?,
@@ -2086,6 +2409,7 @@ class ChatDataSourceImpl(
         )
         return requestTaskExecutionStreaming(
             sessionId = sessionId,
+            session = session,
             userPayload = payload,
             partialResponseSoFar = partialResponseSoFar,
             onExecutionMessage = onExecutionMessage
@@ -2094,6 +2418,7 @@ class ChatDataSourceImpl(
 
     private suspend fun requestTaskValidation(
         sessionId: String,
+        session: SessionEntity,
         taskDescription: String,
         approvedPlan: String,
         executionReport: String,
@@ -2108,34 +2433,43 @@ class ChatDataSourceImpl(
             userProfilePayload = userProfilePayload,
             partialResponseSoFar = partialResponseSoFar
         )
+        val invariantMessage = buildInvariantContextMessage(session)
         return requestSingleAssistantMessageStreaming(
             sessionId = sessionId,
             stage = TaskStage.VALIDATION,
             systemPrompt = TASK_VALIDATION_SYSTEM_PROMPT,
             userPayload = payload,
             partialResponseSoFar = partialResponseSoFar,
+            additionalSystemMessages = listOfNotNull(invariantMessage),
             emitPartial = emitPartial
         )
     }
 
     private suspend fun requestTaskExecutionStreaming(
         sessionId: String,
+        session: SessionEntity,
         userPayload: String,
         partialResponseSoFar: String?,
         onExecutionMessage: suspend (StageAssistantMessage) -> Unit
     ): String {
+        val invariantMessage = buildInvariantContextMessage(session)
         val request = ChatCompletionRequest(
             model = DEFAULT_MODEL,
-            messages = listOf(
-                ChatCompletionMessage(
-                    role = SYSTEM_ROLE,
-                    content = TASK_EXECUTION_SYSTEM_PROMPT
-                ),
-                ChatCompletionMessage(
-                    role = USER_ROLE,
-                    content = userPayload
+            messages = buildList {
+                add(
+                    ChatCompletionMessage(
+                        role = SYSTEM_ROLE,
+                        content = TASK_EXECUTION_SYSTEM_PROMPT
+                    )
                 )
-            ),
+                invariantMessage?.let { add(it) }
+                add(
+                    ChatCompletionMessage(
+                        role = USER_ROLE,
+                        content = userPayload
+                    )
+                )
+            },
             stream = true,
             streamOptions = StreamOptions(includeUsage = false)
         )
@@ -2203,20 +2537,26 @@ class ChatDataSourceImpl(
         systemPrompt: String,
         userPayload: String,
         partialResponseSoFar: String?,
+        additionalSystemMessages: List<ChatCompletionMessage> = emptyList(),
         emitPartial: suspend (String) -> Unit
     ): String {
         val request = ChatCompletionRequest(
             model = DEFAULT_MODEL,
-            messages = listOf(
-                ChatCompletionMessage(
-                    role = SYSTEM_ROLE,
-                    content = systemPrompt
-                ),
-                ChatCompletionMessage(
-                    role = USER_ROLE,
-                    content = userPayload
+            messages = buildList {
+                add(
+                    ChatCompletionMessage(
+                        role = SYSTEM_ROLE,
+                        content = systemPrompt
+                    )
                 )
-            ),
+                addAll(additionalSystemMessages)
+                add(
+                    ChatCompletionMessage(
+                        role = USER_ROLE,
+                        content = userPayload
+                    )
+                )
+            },
             stream = true,
             streamOptions = StreamOptions(includeUsage = false)
         )
@@ -2395,6 +2735,44 @@ class ChatDataSourceImpl(
         } else {
             ValidationDecision.REPLAN_REQUIRED
         }
+    }
+
+    private fun buildFinalResultCodeValidationIssue(executionFinalResult: String): String? {
+        return if (containsExplicitCode(executionFinalResult)) {
+            null
+        } else {
+            "FINAL_RESULT не содержит явного итогового кода. Добавьте код (предпочтительно в fenced code block)."
+        }
+    }
+
+    private fun containsExplicitCode(text: String): Boolean {
+        val normalized = text.trim()
+        if (normalized.isEmpty()) return false
+        if (CODE_FENCE_REGEX.containsMatchIn(normalized)) return true
+        return KOTLIN_CODE_LINE_REGEX.containsMatchIn(normalized)
+    }
+
+    private fun appendLocalValidationGuard(
+        validationReport: String,
+        localIssue: String?
+    ): String {
+        if (localIssue == null) return validationReport
+        return buildString {
+            append(validationReport.trim())
+            append("\n\nLOCAL_VALIDATION_GUARD:\n")
+            append(localIssue)
+            append("\nFINAL_DECISION_OVERRIDE:\nREPLAN_REQUIRED")
+        }
+    }
+
+    private fun mergeValidationIssues(modelIssues: String?, localIssue: String?): String? {
+        val merged = buildList {
+            modelIssues?.trim()?.ifBlank { null }?.let { add(it) }
+            localIssue?.trim()?.ifBlank { null }?.let { add(it) }
+        }.distinct()
+
+        if (merged.isEmpty()) return null
+        return merged.joinToString(separator = "\n")
     }
 
     private fun extractValidationIssues(validationReport: String): String? {
@@ -3601,6 +3979,40 @@ class ChatDataSourceImpl(
         const val DEFAULT_VALIDATION_REPLAN_REASON = "Validation reported unresolved issues."
         const val TASK_PAUSE_CANCELLATION_REASON = "TASK_PAUSED"
         const val TASK_PAUSED_HINT = "Процесс задачи на паузе. Нажмите «Продолжить»."
+        const val INVARIANT_RULE_KEY_KOTLIN_ONLY = "kotlin_only"
+        const val INVARIANT_RULE_KEY_FUNCTIONS_UNDER_10_LINES = "functions_under_10_lines"
+        val REMOVED_INVARIANT_RULE_KEYS = listOf(
+            "no_data_loss_without_confirmation",
+            "no_secret_disclosure",
+            "no_harmful_or_illegal_guidance"
+        )
+        val DEFAULT_INVARIANT_RULE_KEYS = setOf(
+            INVARIANT_RULE_KEY_KOTLIN_ONLY,
+            INVARIANT_RULE_KEY_FUNCTIONS_UNDER_10_LINES
+        )
+        val INVARIANT_RESULT_REGEX = Regex(
+            pattern = "RESULT\\s*=\\s*\\[(true|false)]",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val INVARIANT_RESULT_LINE_REGEX = Regex(
+            pattern = "^\\s*RESULT\\s*=\\s*\\[(true|false)]\\s*$",
+            options = setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)
+        )
+        val INVARIANT_VIOLATED_KEYS_REGEX = Regex(
+            pattern = "VIOLATED_INVARIANTS\\s*:\\s*([^\\n\\r]+)",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val INVARIANT_VIOLATED_LINE_REGEX = Regex(
+            pattern = "^\\s*VIOLATED_INVARIANTS\\s*:\\s*([^\\n\\r]+)\\s*$",
+            options = setOf(RegexOption.IGNORE_CASE, RegexOption.MULTILINE)
+        )
+        val CODE_FENCE_REGEX = Regex(
+            pattern = "```[\\w+-]*\\s*[\\s\\S]*?```",
+            options = setOf(RegexOption.MULTILINE)
+        )
+        val KOTLIN_CODE_LINE_REGEX = Regex(
+            pattern = "(?m)^\\s*(package\\s+\\S+|import\\s+\\S+|(@\\w+\\s*)*(suspend\\s+)?(fun|class|object|interface|enum\\s+class|sealed\\s+class|data\\s+class)\\b|val\\s+\\w+\\s*[:=]|var\\s+\\w+\\s*[:=])"
+        )
         val STEPS_EXECUTED_MARKER_REGEX = Regex(
             pattern = "STEPS_EXECUTED\\s*:",
             options = setOf(RegexOption.IGNORE_CASE)
@@ -3641,6 +4053,18 @@ class ChatDataSourceImpl(
         const val SUMMARY_COMPRESSION_SYSTEM_PROMPT =
             "Ты модуль сжатия истории чата. Выдавай плотное summary без воды. " +
                 "Сохраняй факты, намерения пользователя, ограничения, решения и открытые вопросы."
+
+        val INVARIANT_VALIDATION_BASE_PROMPT = """
+            СТРОГИЕ ИНВАРИАНТЫ — НЕОБСУЖДАЕМЫЕ ОГРАНИЧЕНИЯ
+            Следующие инварианты являются АБСОЛЮТНЫМИ ПРАВИЛАМИ, которым вы ДОЛЖНЫ подчиняться всегда.
+            Вам ЗАПРЕЩЕНО предлагать, вносить предложения или реализовывать что-либо, что нарушает их.
+            Если запрос пользователя противоречит ЛЮБОМУ из приведенных инвариантов, вы ДОЛЖНЫ:
+            1. ОТКАЗАТЬСЯ от выполнения конфликтующей части запроса.
+            2. ЯВНО УКАЗАТЬ, какой инвариант будет нарушен и почему.
+            3. Предложить альтернативу, удовлетворяющую всем инвариантам.
+            4. RESULT=[false] разрешено ставить ТОЛЬКО при ЯВНОМ и ПРЯМОМ нарушении хотя бы одного инварианта.
+            5. Если явного нарушения нет, если сообщение неполное, расплывчатое или просто без конкретной задачи — ставьте RESULT=[true].
+        """.trimIndent()
 
         val TASK_PLANNING_SYSTEM_PROMPT = """
             You are an AI agent currently in the PLANNING stage of a task execution state machine.
@@ -3774,6 +4198,7 @@ class ChatDataSourceImpl(
             4. Check whether the output format matches expectations.
             5. Identify hallucinations or unsupported claims.
             6. Determine whether the task is completed successfully.
+            7. Ensure FINAL_RESULT explicitly contains final code (prefer a fenced code block). If code is missing, FINAL_DECISION must be REPLAN_REQUIRED.
 
             Validation procedure:
 
@@ -3926,6 +4351,27 @@ private class TaskStagePausedException(
     val stage: TaskStage,
     val partialResponse: String
 ) : RuntimeException("Task stage ${stage.name} paused")
+
+private data class InvariantCheckOutcome(
+    val allowed: Boolean,
+    val messageForUser: String
+) {
+    companion object {
+        fun allowed(): InvariantCheckOutcome {
+            return InvariantCheckOutcome(
+                allowed = true,
+                messageForUser = ""
+            )
+        }
+
+        fun rejected(messageForUser: String): InvariantCheckOutcome {
+            return InvariantCheckOutcome(
+                allowed = false,
+                messageForUser = messageForUser
+            )
+        }
+    }
+}
 
 private data class PromptUsage(
     val promptTokens: Int,

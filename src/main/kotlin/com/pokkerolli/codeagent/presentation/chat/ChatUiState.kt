@@ -14,6 +14,7 @@ data class ChatSessionUi(
     val isStickyFactsExtractionInProgress: Boolean,
     val isContextSummarizationInProgress: Boolean,
     val taskStage: TaskStage = TaskStage.CONVERSATION,
+    val isInvariantCheckEnabled: Boolean = false,
     val isTaskPaused: Boolean = false
 )
 
@@ -42,6 +43,12 @@ data class UserProfilePresetUi(
     val isBuiltIn: Boolean
 )
 
+data class InvariantRuleUi(
+    val id: Long,
+    val title: String,
+    val description: String
+)
+
 data class ProfileBuilderMessageUi(
     val stableId: String,
     val role: MessageRole,
@@ -64,7 +71,10 @@ data class ChatUiState(
     val isActiveSessionStickyFactsExtractionInProgress: Boolean = false,
     val isActiveSessionContextSummarizationInProgress: Boolean = false,
     val activeSessionTaskStage: TaskStage = TaskStage.CONVERSATION,
+    val activeSessionInvariantCheckEnabled: Boolean = false,
     val activeSessionTaskPaused: Boolean = false,
+    val invariantRules: List<InvariantRuleUi> = emptyList(),
+    val isInvariantEnableDialogVisible: Boolean = false,
     val messages: List<ChatMessageUi> = emptyList(),
     val input: String = "",
     val isSending: Boolean = false,

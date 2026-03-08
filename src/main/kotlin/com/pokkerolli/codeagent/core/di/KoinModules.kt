@@ -6,6 +6,7 @@ import androidx.sqlite.SQLiteConnection
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.pokkerolli.codeagent.config.AppConfig
 import com.pokkerolli.codeagent.data.local.dao.MessageDao
+import com.pokkerolli.codeagent.data.local.dao.InvariantRuleDao
 import com.pokkerolli.codeagent.data.local.dao.SessionDao
 import com.pokkerolli.codeagent.data.local.dao.UserProfilePresetDao
 import com.pokkerolli.codeagent.data.local.datastore.ActiveSessionPreferences
@@ -21,6 +22,7 @@ import com.pokkerolli.codeagent.domain.usecase.CreateSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.DeleteSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.GetActiveSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveMessagesUseCase
+import com.pokkerolli.codeagent.domain.usecase.ObserveInvariantRulesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveSessionsUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveUserProfilePresetsUseCase
 import com.pokkerolli.codeagent.domain.usecase.RequestTaskPauseUseCase
@@ -29,6 +31,7 @@ import com.pokkerolli.codeagent.domain.usecase.ResumeTaskStreamingUseCase
 import com.pokkerolli.codeagent.domain.usecase.SendMessageUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetActiveSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionContextWindowModeUseCase
+import com.pokkerolli.codeagent.domain.usecase.SetSessionInvariantCheckEnabledUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionSystemPromptUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionUserProfileUseCase
 import com.pokkerolli.codeagent.domain.usecase.StreamUserProfileBuilderReplyUseCase
@@ -79,7 +82,8 @@ val databaseModule = module {
                 MIGRATION_13_14,
                 MIGRATION_14_15,
                 MIGRATION_15_16,
-                MIGRATION_16_17
+                MIGRATION_16_17,
+                MIGRATION_17_18
             )
             .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
@@ -88,6 +92,7 @@ val databaseModule = module {
     single<SessionDao> { get<AppDatabase>().sessionDao() }
     single<MessageDao> { get<AppDatabase>().messageDao() }
     single<UserProfilePresetDao> { get<AppDatabase>().userProfilePresetDao() }
+    single<InvariantRuleDao> { get<AppDatabase>().invariantRuleDao() }
     single { ActiveSessionPreferences() }
 }
 
@@ -143,6 +148,7 @@ val repositoryModule = module {
             database = get(),
             sessionDao = get(),
             messageDao = get(),
+            invariantRuleDao = get(),
             userProfilePresetDao = get(),
             deepSeekApi = get(),
             sseStreamParser = get(),
@@ -159,6 +165,7 @@ val repositoryModule = module {
 val useCaseModule = module {
     factory { SendMessageUseCase(get()) }
     factory { ObserveMessagesUseCase(get()) }
+    factory { ObserveInvariantRulesUseCase(get()) }
     factory { ObserveSessionsUseCase(get()) }
     factory { ObserveUserProfilePresetsUseCase(get()) }
     factory { CreateSessionUseCase(get()) }
@@ -168,6 +175,7 @@ val useCaseModule = module {
     factory { SetActiveSessionUseCase(get()) }
     factory { SetSessionSystemPromptUseCase(get()) }
     factory { SetSessionUserProfileUseCase(get()) }
+    factory { SetSessionInvariantCheckEnabledUseCase(get()) }
     factory { SetSessionContextWindowModeUseCase(get()) }
     factory { StreamUserProfileBuilderReplyUseCase(get()) }
     factory { RunContextSummarizationIfNeededUseCase(get()) }
@@ -181,6 +189,7 @@ val viewModelModule = module {
         ChatViewModel(
             sendMessageUseCase = get(),
             observeMessagesUseCase = get(),
+            observeInvariantRulesUseCase = get(),
             observeSessionsUseCase = get(),
             observeUserProfilePresetsUseCase = get(),
             createSessionUseCase = get(),
@@ -190,6 +199,7 @@ val viewModelModule = module {
             setActiveSessionUseCase = get(),
             setSessionSystemPromptUseCase = get(),
             setSessionUserProfileUseCase = get(),
+            setSessionInvariantCheckEnabledUseCase = get(),
             setSessionContextWindowModeUseCase = get(),
             streamUserProfileBuilderReplyUseCase = get(),
             runContextSummarizationIfNeededUseCase = get(),
@@ -402,6 +412,63 @@ private val MIGRATION_16_17 = object : Migration(16, 17) {
                 "ADD COLUMN isTaskPaused INTEGER NOT NULL DEFAULT 0"
         )
         connection.execSql("ALTER TABLE chat_sessions ADD COLUMN taskPausedPartialResponse TEXT")
+    }
+}
+
+private val MIGRATION_17_18 = object : Migration(17, 18) {
+    override fun migrate(connection: SQLiteConnection) {
+        connection.execSql(
+            "ALTER TABLE chat_sessions " +
+                "ADD COLUMN isInvariantCheckEnabled INTEGER NOT NULL DEFAULT 0"
+        )
+        connection.execSql(
+            """
+            CREATE TABLE IF NOT EXISTS invariant_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                ruleKey TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                isActive INTEGER NOT NULL DEFAULT 1,
+                createdAt INTEGER NOT NULL,
+                updatedAt INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        connection.execSql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS index_invariant_rules_ruleKey ON invariant_rules(ruleKey)"
+        )
+        val now = System.currentTimeMillis()
+        connection.execSql(
+            """
+            INSERT OR IGNORE INTO invariant_rules (
+                ruleKey, title, description, position, isActive, createdAt, updatedAt
+            ) VALUES (
+                'kotlin_only',
+                'Код только на Kotlin',
+                'Запрещено предлагать или генерировать код на любом языке, кроме Kotlin.',
+                1,
+                1,
+                $now,
+                $now
+            )
+            """.trimIndent()
+        )
+        connection.execSql(
+            """
+            INSERT OR IGNORE INTO invariant_rules (
+                ruleKey, title, description, position, isActive, createdAt, updatedAt
+            ) VALUES (
+                'functions_under_10_lines',
+                'Функции короче 10 строк',
+                'Каждая функция в коде должна содержать менее 10 строк.',
+                2,
+                1,
+                $now,
+                $now
+            )
+            """.trimIndent()
+        )
     }
 }
 

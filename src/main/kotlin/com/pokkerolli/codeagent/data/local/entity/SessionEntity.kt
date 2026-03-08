@@ -27,6 +27,7 @@ data class SessionEntity(
     val taskFinalResult: String? = null,
     val taskReplanReason: String? = null,
     val taskAutoReplanCount: Int = 0,
+    val isInvariantCheckEnabled: Boolean = false,
     val isTaskPaused: Boolean = false,
     val taskPausedPartialResponse: String? = null
 )

@@ -13,6 +13,7 @@ import com.pokkerolli.codeagent.domain.usecase.CreateSessionBranchUseCase
 import com.pokkerolli.codeagent.domain.usecase.CreateSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.DeleteSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.GetActiveSessionUseCase
+import com.pokkerolli.codeagent.domain.usecase.ObserveInvariantRulesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveMessagesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveUserProfilePresetsUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveSessionsUseCase
@@ -22,6 +23,7 @@ import com.pokkerolli.codeagent.domain.usecase.ResumeTaskStreamingUseCase
 import com.pokkerolli.codeagent.domain.usecase.SendMessageUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetActiveSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionContextWindowModeUseCase
+import com.pokkerolli.codeagent.domain.usecase.SetSessionInvariantCheckEnabledUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionSystemPromptUseCase
 import com.pokkerolli.codeagent.domain.usecase.SetSessionUserProfileUseCase
 import com.pokkerolli.codeagent.domain.usecase.StreamUserProfileBuilderReplyUseCase
@@ -40,6 +42,7 @@ import java.net.UnknownHostException
 class ChatViewModel(
     private val sendMessageUseCase: SendMessageUseCase,
     private val observeMessagesUseCase: ObserveMessagesUseCase,
+    private val observeInvariantRulesUseCase: ObserveInvariantRulesUseCase,
     private val observeSessionsUseCase: ObserveSessionsUseCase,
     private val observeUserProfilePresetsUseCase: ObserveUserProfilePresetsUseCase,
     private val createSessionUseCase: CreateSessionUseCase,
@@ -49,6 +52,7 @@ class ChatViewModel(
     private val setActiveSessionUseCase: SetActiveSessionUseCase,
     private val setSessionSystemPromptUseCase: SetSessionSystemPromptUseCase,
     private val setSessionUserProfileUseCase: SetSessionUserProfileUseCase,
+    private val setSessionInvariantCheckEnabledUseCase: SetSessionInvariantCheckEnabledUseCase,
     private val setSessionContextWindowModeUseCase: SetSessionContextWindowModeUseCase,
     private val streamUserProfileBuilderReplyUseCase: StreamUserProfileBuilderReplyUseCase,
     private val runContextSummarizationIfNeededUseCase: RunContextSummarizationIfNeededUseCase,
@@ -71,6 +75,7 @@ class ChatViewModel(
 
     init {
         observeSessions()
+        observeInvariantRules()
         observeUserProfilePresets()
         observeActiveSession()
     }
@@ -282,6 +287,49 @@ class ChatViewModel(
         }
     }
 
+    fun onOpenInvariantEnableDialog() {
+        val state = _uiState.value
+        if (state.activeSessionId == null) return
+        if (state.activeSessionInvariantCheckEnabled) return
+        _uiState.update {
+            it.copy(isInvariantEnableDialogVisible = true)
+        }
+    }
+
+    fun onDismissInvariantEnableDialog() {
+        _uiState.update {
+            it.copy(isInvariantEnableDialogVisible = false)
+        }
+    }
+
+    fun onConfirmInvariantEnableDialog() {
+        val state = _uiState.value
+        val sessionId = state.activeSessionId ?: return
+        if (state.activeSessionInvariantCheckEnabled) {
+            _uiState.update {
+                it.copy(isInvariantEnableDialogVisible = false)
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            runCatching {
+                setSessionInvariantCheckEnabledUseCase.execute(
+                    sessionId = sessionId,
+                    enabled = true
+                ).getOrThrow()
+            }.onSuccess {
+                _uiState.update {
+                    it.copy(isInvariantEnableDialogVisible = false)
+                }
+            }.onFailure { throwable ->
+                _uiState.update {
+                    it.copy(errorMessage = throwable.toUiMessage())
+                }
+            }
+        }
+    }
+
     fun onCreateNewSession() {
         cancelCurrentStream()
         viewModelScope.launch {
@@ -487,6 +535,24 @@ class ChatViewModel(
         _uiState.update { it.copy(errorMessage = null) }
     }
 
+    private fun observeInvariantRules() {
+        viewModelScope.launch {
+            observeInvariantRulesUseCase.execute().getOrThrow().collect { rules ->
+                _uiState.update {
+                    it.copy(
+                        invariantRules = rules.map { rule ->
+                            InvariantRuleUi(
+                                id = rule.id,
+                                title = rule.title,
+                                description = rule.description
+                            )
+                        }
+                    )
+                }
+            }
+        }
+    }
+
     private fun observeUserProfilePresets() {
         viewModelScope.launch {
             observeUserProfilePresetsUseCase.execute().getOrThrow().collect { presets ->
@@ -593,6 +659,7 @@ class ChatViewModel(
                         isStickyFactsExtractionInProgress = it.isStickyFactsExtractionInProgress,
                         isContextSummarizationInProgress = it.isContextSummarizationInProgress,
                         taskStage = it.taskStage,
+                        isInvariantCheckEnabled = it.isInvariantCheckEnabled,
                         isTaskPaused = it.isTaskPaused
                     )
                 },
@@ -607,6 +674,8 @@ class ChatViewModel(
                 isActiveSessionContextSummarizationInProgress =
                     selectedSession?.isContextSummarizationInProgress ?: false,
                 activeSessionTaskStage = selectedSession?.taskStage ?: TaskStage.CONVERSATION,
+                activeSessionInvariantCheckEnabled =
+                    selectedSession?.isInvariantCheckEnabled ?: false,
                 activeSessionTaskPaused = selectedSession?.isTaskPaused ?: false
             )
         }

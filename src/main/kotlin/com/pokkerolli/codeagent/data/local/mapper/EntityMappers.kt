@@ -1,11 +1,13 @@
 package com.pokkerolli.codeagent.data.local.mapper
 
 import com.pokkerolli.codeagent.data.local.entity.MessageEntity
+import com.pokkerolli.codeagent.data.local.entity.InvariantRuleEntity
 import com.pokkerolli.codeagent.data.local.entity.SessionEntity
 import com.pokkerolli.codeagent.data.local.entity.UserProfilePresetEntity
 import com.pokkerolli.codeagent.domain.model.ChatMessage
 import com.pokkerolli.codeagent.domain.model.ChatSession
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
+import com.pokkerolli.codeagent.domain.model.InvariantRule
 import com.pokkerolli.codeagent.domain.model.MessageRole
 import com.pokkerolli.codeagent.domain.model.TaskStage
 import com.pokkerolli.codeagent.domain.model.UserProfilePreset
@@ -26,6 +28,7 @@ fun SessionEntity.toDomain(): ChatSession {
         taskStage = TaskStage.fromStored(taskStage),
         taskDescription = taskDescription,
         taskFinalResult = taskFinalResult,
+        isInvariantCheckEnabled = isInvariantCheckEnabled,
         isTaskPaused = isTaskPaused
     )
 }
@@ -52,5 +55,13 @@ fun UserProfilePresetEntity.toDomain(): UserProfilePreset {
         label = label,
         payloadJson = payloadJson,
         isBuiltIn = false
+    )
+}
+
+fun InvariantRuleEntity.toDomain(): InvariantRule {
+    return InvariantRule(
+        id = id,
+        title = title,
+        description = description
     )
 }

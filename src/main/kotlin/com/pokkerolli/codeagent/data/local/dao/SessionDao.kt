@@ -39,6 +39,12 @@ interface SessionDao {
     suspend fun updateUserProfileName(sessionId: String, userProfileName: String?, updatedAt: Long)
 
     @Query(
+        "UPDATE chat_sessions SET isInvariantCheckEnabled = :enabled, updatedAt = :updatedAt " +
+            "WHERE id = :sessionId"
+    )
+    suspend fun updateInvariantCheckEnabled(sessionId: String, enabled: Boolean, updatedAt: Long)
+
+    @Query(
         "UPDATE chat_sessions SET longTermMemoryJson = :longTermMemoryJson, updatedAt = :updatedAt " +
             "WHERE id = :sessionId"
     )

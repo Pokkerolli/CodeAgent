@@ -42,6 +42,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -89,6 +90,9 @@ fun ChatRoute(
         onCreateSession = viewModel::onCreateNewSession,
         onCreateBranchClick = viewModel::onCreateBranchClicked,
         onTaskPauseResumeClick = viewModel::onTaskPauseResumeClicked,
+        onOpenInvariantEnableDialog = viewModel::onOpenInvariantEnableDialog,
+        onDismissInvariantEnableDialog = viewModel::onDismissInvariantEnableDialog,
+        onConfirmInvariantEnableDialog = viewModel::onConfirmInvariantEnableDialog,
         onSystemPromptSelected = viewModel::onSystemPromptSelected,
         onUserProfileSelected = viewModel::onUserProfileSelected,
         onOpenCustomProfileBuilder = viewModel::onOpenCustomProfileBuilder,
@@ -112,6 +116,9 @@ private fun ChatScreen(
     onCreateSession: () -> Unit,
     onCreateBranchClick: (Long) -> Unit,
     onTaskPauseResumeClick: () -> Unit,
+    onOpenInvariantEnableDialog: () -> Unit,
+    onDismissInvariantEnableDialog: () -> Unit,
+    onConfirmInvariantEnableDialog: () -> Unit,
     onSystemPromptSelected: (String) -> Unit,
     onUserProfileSelected: (String?) -> Unit,
     onOpenCustomProfileBuilder: () -> Unit,
@@ -261,8 +268,10 @@ private fun ChatScreen(
                     usage = state.usage,
                     isAssistantResponding = state.isSending,
                     currentTaskStage = state.activeSessionTaskStage,
+                    isInvariantCheckEnabled = state.activeSessionInvariantCheckEnabled,
                     isTaskPaused = state.activeSessionTaskPaused,
-                    onTaskPauseResumeClick = onTaskPauseResumeClick
+                    onTaskPauseResumeClick = onTaskPauseResumeClick,
+                    onEnableInvariantClick = onOpenInvariantEnableDialog
                 )
 
                 LazyColumn(
@@ -301,6 +310,14 @@ private fun ChatScreen(
             onApplyProfileClick = onApplyCustomProfileClick
         )
     }
+
+    if (state.isInvariantEnableDialogVisible) {
+        InvariantEnableDialog(
+            rules = state.invariantRules,
+            onDismissRequest = onDismissInvariantEnableDialog,
+            onConfirmClick = onConfirmInvariantEnableDialog
+        )
+    }
 }
 
 @Composable
@@ -308,8 +325,10 @@ private fun ConversationUsagePanel(
     usage: ConversationUsageUi,
     isAssistantResponding: Boolean,
     currentTaskStage: TaskStage,
+    isInvariantCheckEnabled: Boolean,
     isTaskPaused: Boolean,
     onTaskPauseResumeClick: () -> Unit,
+    onEnableInvariantClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -354,6 +373,19 @@ private fun ConversationUsagePanel(
                         Text(text = if (isAssistantResponding) "Пауза" else "Продолжить")
                     }
                 }
+
+                TextButton(
+                    onClick = onEnableInvariantClick,
+                    enabled = !isInvariantCheckEnabled
+                ) {
+                    Text(
+                        text = if (isInvariantCheckEnabled) {
+                            "Инварианты: включены"
+                        } else {
+                            "Включить инварианты"
+                        }
+                    )
+                }
             }
 
             if (currentTaskStage != TaskStage.CONVERSATION) {
@@ -361,6 +393,55 @@ private fun ConversationUsagePanel(
             }
         }
     }
+}
+
+@Composable
+private fun InvariantEnableDialog(
+    rules: List<InvariantRuleUi>,
+    onDismissRequest: () -> Unit,
+    onConfirmClick: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismissRequest,
+        title = {
+            Text(text = "Включить инварианты?")
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(text = "Точно хотите включить проверку на инварианты для текущей сессии?")
+                if (rules.isEmpty()) {
+                    Text(
+                        text = "Активных инвариантов пока нет.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Text(
+                        text = "Будут учитываться правила:",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    rules.forEachIndexed { index, rule ->
+                        Text(
+                            text = "${index + 1}. ${rule.title}\n${rule.description}",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismissRequest) {
+                Text(text = "Отмена")
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirmClick) {
+                Text(text = "Включить")
+            }
+        }
+    )
 }
 
 @Composable
@@ -1062,6 +1143,9 @@ private fun ChatScreenPreview() {
                 onCreateSession = {},
                 onCreateBranchClick = {},
                 onTaskPauseResumeClick = {},
+                onOpenInvariantEnableDialog = {},
+                onDismissInvariantEnableDialog = {},
+                onConfirmInvariantEnableDialog = {},
                 onSystemPromptSelected = {},
                 onUserProfileSelected = {},
                 onOpenCustomProfileBuilder = {},
@@ -1145,6 +1229,9 @@ private fun ChatScreenWithCustomProfileBuilderPreview() {
                 onCreateSession = {},
                 onCreateBranchClick = {},
                 onTaskPauseResumeClick = {},
+                onOpenInvariantEnableDialog = {},
+                onDismissInvariantEnableDialog = {},
+                onConfirmInvariantEnableDialog = {},
                 onSystemPromptSelected = {},
                 onUserProfileSelected = {},
                 onOpenCustomProfileBuilder = {},
