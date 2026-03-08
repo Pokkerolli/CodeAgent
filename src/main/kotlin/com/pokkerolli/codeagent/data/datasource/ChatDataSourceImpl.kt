@@ -23,6 +23,7 @@ import com.pokkerolli.codeagent.domain.model.ChatMessage
 import com.pokkerolli.codeagent.domain.model.ChatSession
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
 import com.pokkerolli.codeagent.domain.model.MessageRole
+import com.pokkerolli.codeagent.domain.model.TaskStage
 import com.pokkerolli.codeagent.domain.model.USER_PROFILE_PRESETS
 import com.pokkerolli.codeagent.domain.model.UserProfileBuilderMessage
 import com.pokkerolli.codeagent.domain.model.UserProfilePreset
@@ -59,6 +60,7 @@ class ChatDataSourceImpl(
 ) : ChatDataSource {
 
     private val summarizationMutexBySession = ConcurrentHashMap<String, Mutex>()
+    private val taskPauseRequestedBySession = ConcurrentHashMap<String, Boolean>()
 
     override fun observeSessions(): Flow<List<ChatSession>> {
         return sessionDao.observeSessions().map { sessions ->
@@ -112,7 +114,17 @@ class ChatDataSourceImpl(
             isStickyFactsExtractionInProgress = false,
             contextSummary = sourceSession.contextSummary,
             summarizedMessagesCount = sourceSession.summarizedMessagesCount,
-            isContextSummarizationInProgress = false
+            isContextSummarizationInProgress = false,
+            taskStage = sourceSession.taskStage,
+            taskDescription = sourceSession.taskDescription,
+            taskPlan = sourceSession.taskPlan,
+            taskExecutionReport = sourceSession.taskExecutionReport,
+            taskValidationReport = sourceSession.taskValidationReport,
+            taskFinalResult = sourceSession.taskFinalResult,
+            taskReplanReason = sourceSession.taskReplanReason,
+            taskAutoReplanCount = sourceSession.taskAutoReplanCount,
+            isTaskPaused = sourceSession.isTaskPaused,
+            taskPausedPartialResponse = sourceSession.taskPausedPartialResponse
         )
 
         database.withTransactionCompat {
@@ -130,7 +142,9 @@ class ChatDataSourceImpl(
                             promptCacheMissTokens = source.promptCacheMissTokens,
                             completionTokens = source.completionTokens,
                             totalTokens = source.totalTokens,
-                            compressionState = source.compressionState
+                            compressionState = source.compressionState,
+                            taskStage = source.taskStage,
+                            includeInModelContext = source.includeInModelContext
                         )
                     }
                 )
@@ -143,6 +157,7 @@ class ChatDataSourceImpl(
     override suspend fun deleteSession(sessionId: String) {
         sessionDao.deleteSessionById(sessionId)
         summarizationMutexBySession.remove(sessionId)
+        taskPauseRequestedBySession.remove(sessionId)
     }
 
     override suspend fun setActiveSession(sessionId: String) {
@@ -370,9 +385,11 @@ class ChatDataSourceImpl(
                 createdAt = now,
                 updatedAt = now
             )
+            val currentTaskStage = TaskStage.fromStored(session.taskStage)
 
             val resolvedTitle = if (
                 controlCommand == null &&
+                currentTaskStage == TaskStage.CONVERSATION &&
                 session.title == DEFAULT_SESSION_TITLE
             ) {
                 cleanedContent.toSessionTitle()
@@ -384,6 +401,8 @@ class ChatDataSourceImpl(
                 title = resolvedTitle,
                 updatedAt = now
             )
+            val includeUserMessageInModelContext =
+                controlCommand == null && currentTaskStage == TaskStage.CONVERSATION
 
             var userMessageId: Long = 0L
             database.withTransactionCompat {
@@ -392,46 +411,113 @@ class ChatDataSourceImpl(
                     MessageEntity(
                         sessionId = sessionId,
                         role = MessageRole.USER.name,
+                        taskStage = currentTaskStage.name,
+                        includeInModelContext = includeUserMessageInModelContext,
                         content = cleanedContent,
                         createdAt = now
                     )
                 )
             }
 
-            if (controlCommand != null) {
-                val commandResponse = handleControlCommand(
-                    session = sessionSnapshot,
-                    command = controlCommand
-                )
+            if (controlCommand == null && currentTaskStage != TaskStage.CONVERSATION) {
+                val formatReply = if (sessionSnapshot.isTaskPaused) {
+                    TASK_PAUSED_HINT
+                } else {
+                    buildTaskStageInputHint(currentTaskStage)
+                }
                 val doneTimestamp = System.currentTimeMillis()
                 database.withTransactionCompat {
-                    if (commandResponse.memoryChanged) {
-                        sessionDao.updateLongTermMemory(
-                            sessionId = sessionId,
-                            longTermMemoryJson = serializeLongTermMemoryInstructions(
-                                commandResponse.memoryInstructions.orEmpty()
-                            ),
-                            updatedAt = doneTimestamp
-                        )
-                    }
-                    if (commandResponse.workTaskChanged) {
-                        sessionDao.updateCurrentWorkTask(
-                            sessionId = sessionId,
-                            currentWorkTaskJson = serializeCurrentWorkTask(commandResponse.workTaskContext),
-                            updatedAt = doneTimestamp
-                        )
-                    }
                     messageDao.insertMessage(
                         MessageEntity(
                             sessionId = sessionId,
                             role = MessageRole.ASSISTANT.name,
-                            content = commandResponse.reply,
+                            taskStage = currentTaskStage.name,
+                            includeInModelContext = false,
+                            content = formatReply,
                             createdAt = doneTimestamp
                         )
                     )
                     sessionDao.touchSession(sessionId, doneTimestamp)
                 }
-                emit(commandResponse.reply)
+                emit(formatReply)
+                return@flow
+            }
+
+            if (controlCommand != null) {
+                when (controlCommand) {
+                    is ChatControlCommand.Memory,
+                    is ChatControlCommand.Work -> {
+                        val commandResponse = handleControlCommand(
+                            session = sessionSnapshot,
+                            command = controlCommand
+                        )
+                        val doneTimestamp = System.currentTimeMillis()
+                        database.withTransactionCompat {
+                            if (commandResponse.memoryChanged) {
+                                sessionDao.updateLongTermMemory(
+                                    sessionId = sessionId,
+                                    longTermMemoryJson = serializeLongTermMemoryInstructions(
+                                        commandResponse.memoryInstructions.orEmpty()
+                                    ),
+                                    updatedAt = doneTimestamp
+                                )
+                            }
+                            if (commandResponse.workTaskChanged) {
+                                sessionDao.updateCurrentWorkTask(
+                                    sessionId = sessionId,
+                                    currentWorkTaskJson = serializeCurrentWorkTask(commandResponse.workTaskContext),
+                                    updatedAt = doneTimestamp
+                                )
+                            }
+                            messageDao.insertMessage(
+                                MessageEntity(
+                                    sessionId = sessionId,
+                                    role = MessageRole.ASSISTANT.name,
+                                    taskStage = currentTaskStage.name,
+                                    includeInModelContext = false,
+                                    content = commandResponse.reply,
+                                    createdAt = doneTimestamp
+                                )
+                            )
+                            sessionDao.touchSession(sessionId, doneTimestamp)
+                        }
+                        emit(commandResponse.reply)
+                    }
+
+                    is ChatControlCommand.Task -> {
+                        val taskCommandOutcome = handleTaskCommand(
+                            sessionId = sessionId,
+                            session = sessionSnapshot,
+                            command = controlCommand.command,
+                            emitPartial = { partial -> emit(partial) }
+                        )
+                        val doneTimestamp = System.currentTimeMillis()
+                        val persistedSession = taskCommandOutcome.updatedSession.copy(
+                            updatedAt = doneTimestamp
+                        )
+                        database.withTransactionCompat {
+                            sessionDao.insertSession(persistedSession)
+                            taskCommandOutcome.assistantMessages.forEachIndexed { index, assistantMessage ->
+                                messageDao.insertMessage(
+                                    MessageEntity(
+                                        sessionId = sessionId,
+                                        role = MessageRole.ASSISTANT.name,
+                                        taskStage = assistantMessage.stage.name,
+                                        includeInModelContext = false,
+                                        content = assistantMessage.content,
+                                        createdAt = doneTimestamp + index
+                                    )
+                                )
+                            }
+                        }
+                        if (!taskCommandOutcome.updatedSession.isTaskPaused) {
+                            clearTaskPauseRequest(sessionId)
+                        }
+                        if (taskCommandOutcome.updatedSession.isTaskPaused) {
+                            throw CancellationException(TASK_PAUSE_CANCELLATION_REASON)
+                        }
+                    }
+                }
                 return@flow
             }
 
@@ -449,7 +535,9 @@ class ChatDataSourceImpl(
                 baseSystemPrompt = sessionSnapshot.systemPrompt.normalizeSystemPrompt(),
                 userProfilePayload = userProfilePayload,
                 memoryInstructions = parseLongTermMemoryInstructions(sessionSnapshot.longTermMemoryJson),
-                currentWorkTask = parseCurrentWorkTask(sessionSnapshot.currentWorkTaskJson)
+                currentWorkTask = parseCurrentWorkTask(sessionSnapshot.currentWorkTaskJson),
+                taskDescription = sessionSnapshot.taskDescription,
+                taskFinalResult = sessionSnapshot.taskFinalResult
             )
             val requestMessages = buildList {
                 if (contextBlock != null) {
@@ -515,6 +603,8 @@ class ChatDataSourceImpl(
                         MessageEntity(
                             sessionId = sessionId,
                             role = MessageRole.ASSISTANT.name,
+                            taskStage = TaskStage.CONVERSATION.name,
+                            includeInModelContext = true,
                             content = finalAssistantText,
                             createdAt = doneTimestamp,
                             completionTokens = finalUsage?.completionTokens,
@@ -552,6 +642,59 @@ class ChatDataSourceImpl(
                 }
             }
 
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        }
+    }
+
+    override suspend fun requestTaskPause(sessionId: String) {
+        val session = sessionDao.getSessionById(sessionId) ?: return
+        val stage = TaskStage.fromStored(session.taskStage)
+        if (stage == TaskStage.CONVERSATION) {
+            return
+        }
+        taskPauseRequestedBySession[sessionId] = true
+    }
+
+    override fun resumeTaskStreaming(sessionId: String): Flow<String> = flow {
+        try {
+            val session = sessionDao.getSessionById(sessionId)
+                ?: throw ChatApiException("Session not found")
+            val stage = TaskStage.fromStored(session.taskStage)
+            if (!session.isTaskPaused) {
+                throw ChatApiException("Task is not paused")
+            }
+            if (stage == TaskStage.CONVERSATION) {
+                throw ChatApiException("Nothing to resume in conversation stage")
+            }
+
+            clearTaskPauseRequest(sessionId)
+
+            val resumeOutcome = handleTaskResume(
+                session = session,
+                emitPartial = { partial -> emit(partial) }
+            )
+            val doneTimestamp = System.currentTimeMillis()
+            val persistedSession = resumeOutcome.updatedSession.copy(updatedAt = doneTimestamp)
+
+            database.withTransactionCompat {
+                sessionDao.insertSession(persistedSession)
+                resumeOutcome.assistantMessages.forEachIndexed { index, assistantMessage ->
+                    messageDao.insertMessage(
+                        MessageEntity(
+                            sessionId = sessionId,
+                            role = MessageRole.ASSISTANT.name,
+                            taskStage = assistantMessage.stage.name,
+                            includeInModelContext = false,
+                            content = assistantMessage.content,
+                            createdAt = doneTimestamp + index
+                        )
+                    )
+                }
+            }
+            if (!resumeOutcome.updatedSession.isTaskPaused) {
+                clearTaskPauseRequest(sessionId)
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         }
@@ -976,6 +1119,10 @@ class ChatDataSourceImpl(
                     command = command.command
                 )
             }
+
+            is ChatControlCommand.Task -> {
+                throw ChatApiException("Task command must be handled by task state machine")
+            }
         }
     }
 
@@ -1126,9 +1273,1711 @@ class ChatDataSourceImpl(
         }
     }
 
+    private suspend fun handleTaskCommand(
+        sessionId: String,
+        session: SessionEntity,
+        command: TaskCommand,
+        emitPartial: suspend (String) -> Unit
+    ): TaskCommandOutcome {
+        val stage = TaskStage.fromStored(session.taskStage)
+
+        fun singleMessageOutcome(targetStage: TaskStage, content: String): TaskCommandOutcome {
+            return TaskCommandOutcome(
+                updatedSession = session,
+                assistantMessages = listOf(
+                    StageAssistantMessage(
+                        stage = targetStage,
+                        content = content
+                    )
+                )
+            )
+        }
+
+        if (session.isTaskPaused) {
+            val reply = "Процесс задачи на паузе. Нажмите «Продолжить»."
+            emitPartial(reply)
+            return singleMessageOutcome(stage, reply)
+        }
+
+        return when (command) {
+            is TaskCommand.Invalid -> {
+                emitPartial(command.reply)
+                singleMessageOutcome(stage, command.reply)
+            }
+
+            is TaskCommand.Start -> {
+                if (stage != TaskStage.CONVERSATION) {
+                    val reply = buildInvalidTaskCommandReply(stage)
+                    emitPartial(reply)
+                    return singleMessageOutcome(stage, reply)
+                }
+
+                val planningSession = persistTaskSessionState(
+                    transitionTaskStage(
+                        session = session.copy(
+                            taskDescription = command.description,
+                            taskPlan = null,
+                            taskExecutionReport = null,
+                            taskValidationReport = null,
+                            taskFinalResult = null,
+                            taskReplanReason = null,
+                            taskAutoReplanCount = 0,
+                            isTaskPaused = false,
+                            taskPausedPartialResponse = null
+                        ),
+                        target = TaskStage.PLANNING
+                    )
+                )
+
+                val userProfilePayload = resolveUserProfilePayload(planningSession.userProfileName)
+                val generatedPlan = try {
+                    requestTaskPlanning(
+                        sessionId = sessionId,
+                        taskDescription = planningSession.taskDescription.orEmpty(),
+                        userProfilePayload = userProfilePayload,
+                        replanReason = null,
+                        partialResponseSoFar = null,
+                        emitPartial = emitPartial
+                    )
+                } catch (paused: TaskStagePausedException) {
+                    return buildPausedTaskOutcome(
+                        session = planningSession,
+                        stage = paused.stage,
+                        partialResponse = paused.partialResponse
+                    )
+                }
+                val planningReply = buildPlanningApprovalReply(plan = generatedPlan)
+                emitPartial(planningReply)
+
+                TaskCommandOutcome(
+                    updatedSession = planningSession.copy(
+                        taskPlan = generatedPlan,
+                        taskReplanReason = null,
+                        isTaskPaused = false,
+                        taskPausedPartialResponse = null
+                    ),
+                    assistantMessages = listOf(
+                        StageAssistantMessage(
+                            stage = TaskStage.PLANNING,
+                            content = planningReply
+                        )
+                    )
+                )
+            }
+
+            TaskCommand.Approve -> {
+                when (stage) {
+                    TaskStage.PLANNING -> {
+                        val taskDescription = session.taskDescription
+                            ?.trim()
+                            ?.ifBlank { null }
+                            ?: run {
+                                val reply = "Не удалось найти описание задачи. Запустите новую задачу через /task <описание>."
+                                emitPartial(reply)
+                                return singleMessageOutcome(stage, reply)
+                            }
+                        val approvedPlan = session.taskPlan
+                            ?.trim()
+                            ?.ifBlank { null }
+                            ?: run {
+                                val reply = "План отсутствует. Используйте /retry <причина>, чтобы собрать новый план."
+                                emitPartial(reply)
+                                return singleMessageOutcome(stage, reply)
+                            }
+
+                        val userProfilePayload = resolveUserProfilePayload(session.userProfileName)
+                        val executionStageSession = persistTaskSessionState(
+                            transitionTaskStage(
+                                session = clearTaskPauseState(session),
+                                target = TaskStage.EXECUTION
+                            )
+                        )
+                        runExecutionThenValidation(
+                            sessionId = sessionId,
+                            executionStageSession = executionStageSession,
+                            taskDescription = taskDescription,
+                            approvedPlan = approvedPlan,
+                            userProfilePayload = userProfilePayload,
+                            executionPartialResponse = null,
+                            emitPartial = emitPartial
+                        )
+                    }
+
+                    TaskStage.DONE -> {
+                        val conversationSession = persistTaskSessionState(
+                            transitionTaskStage(
+                                session = session.copy(
+                                    taskPlan = null,
+                                    taskExecutionReport = null,
+                                    taskValidationReport = null,
+                                    taskReplanReason = null,
+                                    taskAutoReplanCount = 0,
+                                    isTaskPaused = false,
+                                    taskPausedPartialResponse = null
+                                ),
+                                target = TaskStage.CONVERSATION
+                            )
+                        )
+                        val reply = "Задача завершена. Возвращаемся в обычный режим диалога."
+                        emitPartial(reply)
+                        TaskCommandOutcome(
+                            updatedSession = conversationSession,
+                            assistantMessages = listOf(
+                                StageAssistantMessage(
+                                    stage = TaskStage.CONVERSATION,
+                                    content = reply
+                                )
+                            )
+                        )
+                    }
+
+                    else -> {
+                        val reply = buildInvalidTaskCommandReply(stage)
+                        emitPartial(reply)
+                        singleMessageOutcome(stage, reply)
+                    }
+                }
+            }
+
+            is TaskCommand.Retry -> {
+                if (stage != TaskStage.PLANNING) {
+                    val reply = buildInvalidTaskCommandReply(stage)
+                    emitPartial(reply)
+                    return singleMessageOutcome(stage, reply)
+                }
+
+                val taskDescription = session.taskDescription
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply = "Не удалось найти описание задачи. Запустите /task <описание>."
+                        emitPartial(reply)
+                        return singleMessageOutcome(stage, reply)
+                    }
+                val userProfilePayload = resolveUserProfilePayload(session.userProfileName)
+
+                val planningSession = persistTaskSessionState(
+                    transitionTaskStage(
+                        session = session.copy(
+                            taskReplanReason = command.reason,
+                            taskAutoReplanCount = 0,
+                            isTaskPaused = false,
+                            taskPausedPartialResponse = null
+                        ),
+                        target = TaskStage.PLANNING
+                    )
+                )
+                val replanned = try {
+                    requestTaskPlanning(
+                        sessionId = sessionId,
+                        taskDescription = taskDescription,
+                        userProfilePayload = userProfilePayload,
+                        replanReason = command.reason,
+                        partialResponseSoFar = null,
+                        emitPartial = emitPartial
+                    )
+                } catch (paused: TaskStagePausedException) {
+                    return buildPausedTaskOutcome(
+                        session = planningSession,
+                        stage = paused.stage,
+                        partialResponse = paused.partialResponse
+                    )
+                }
+                val replannedReply = buildPlanningApprovalReply(
+                    plan = replanned,
+                    replanReason = command.reason
+                )
+                emitPartial(replannedReply)
+
+                TaskCommandOutcome(
+                    updatedSession = planningSession.copy(
+                        taskPlan = replanned,
+                        isTaskPaused = false,
+                        taskPausedPartialResponse = null
+                    ),
+                    assistantMessages = listOf(
+                        StageAssistantMessage(
+                            stage = TaskStage.PLANNING,
+                            content = replannedReply
+                        )
+                    )
+                )
+            }
+
+            is TaskCommand.Error -> {
+                if (stage != TaskStage.DONE) {
+                    val reply = buildInvalidTaskCommandReply(stage)
+                    emitPartial(reply)
+                    return singleMessageOutcome(stage, reply)
+                }
+
+                val taskDescription = session.taskDescription
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply = "Не удалось найти описание задачи. Запустите /task <описание>."
+                        emitPartial(reply)
+                        return singleMessageOutcome(stage, reply)
+                    }
+                val userProfilePayload = resolveUserProfilePayload(session.userProfileName)
+
+                val planningSession = persistTaskSessionState(
+                    transitionTaskStage(
+                        session = session.copy(
+                            taskReplanReason = command.reason,
+                            taskAutoReplanCount = 0,
+                            isTaskPaused = false,
+                            taskPausedPartialResponse = null
+                        ),
+                        target = TaskStage.PLANNING
+                    )
+                )
+                val replanned = try {
+                    requestTaskPlanning(
+                        sessionId = sessionId,
+                        taskDescription = taskDescription,
+                        userProfilePayload = userProfilePayload,
+                        replanReason = command.reason,
+                        partialResponseSoFar = null,
+                        emitPartial = emitPartial
+                    )
+                } catch (paused: TaskStagePausedException) {
+                    return buildPausedTaskOutcome(
+                        session = planningSession,
+                        stage = paused.stage,
+                        partialResponse = paused.partialResponse
+                    )
+                }
+                val replannedReply = buildPlanningApprovalReply(
+                    plan = replanned,
+                    replanReason = command.reason
+                )
+                emitPartial(replannedReply)
+
+                TaskCommandOutcome(
+                    updatedSession = planningSession.copy(
+                        taskPlan = replanned,
+                        isTaskPaused = false,
+                        taskPausedPartialResponse = null
+                    ),
+                    assistantMessages = listOf(
+                        StageAssistantMessage(
+                            stage = TaskStage.PLANNING,
+                            content = replannedReply
+                        )
+                    )
+                )
+            }
+        }
+    }
+
+    private suspend fun persistTaskSessionState(session: SessionEntity): SessionEntity {
+        val updated = session.copy(updatedAt = System.currentTimeMillis())
+        sessionDao.insertSession(updated)
+        return updated
+    }
+
+    private fun transitionTaskStage(session: SessionEntity, target: TaskStage): SessionEntity {
+        val current = TaskStage.fromStored(session.taskStage)
+        if (!isTaskTransitionAllowed(current = current, target = target)) {
+            throw ChatApiException("Invalid task state transition: ${current.name} -> ${target.name}")
+        }
+        return session.copy(taskStage = target.name)
+    }
+
+    private fun isTaskTransitionAllowed(current: TaskStage, target: TaskStage): Boolean {
+        return when (current) {
+            TaskStage.CONVERSATION -> target == TaskStage.PLANNING
+            TaskStage.PLANNING -> target == TaskStage.PLANNING || target == TaskStage.EXECUTION
+            TaskStage.EXECUTION -> target == TaskStage.VALIDATION
+            TaskStage.VALIDATION -> target == TaskStage.DONE || target == TaskStage.PLANNING
+            TaskStage.DONE -> target == TaskStage.CONVERSATION || target == TaskStage.PLANNING
+        }
+    }
+
+    private fun clearTaskPauseState(session: SessionEntity): SessionEntity {
+        return session.copy(
+            isTaskPaused = false,
+            taskPausedPartialResponse = null
+        )
+    }
+
+    private fun isTaskPauseRequested(sessionId: String): Boolean {
+        return taskPauseRequestedBySession[sessionId] == true
+    }
+
+    private fun clearTaskPauseRequest(sessionId: String) {
+        taskPauseRequestedBySession.remove(sessionId)
+    }
+
+    private fun buildStageMessageKey(message: StageAssistantMessage): String {
+        return "${message.stage.name}|${message.content.trim()}"
+    }
+
+    private suspend fun persistTaskAssistantMessage(
+        sessionId: String,
+        assistantMessage: StageAssistantMessage
+    ) {
+        val timestamp = System.currentTimeMillis()
+        database.withTransactionCompat {
+            messageDao.insertMessage(
+                MessageEntity(
+                    sessionId = sessionId,
+                    role = MessageRole.ASSISTANT.name,
+                    taskStage = assistantMessage.stage.name,
+                    includeInModelContext = false,
+                    content = assistantMessage.content,
+                    createdAt = timestamp
+                )
+            )
+            sessionDao.touchSession(sessionId, timestamp)
+        }
+    }
+
+    private suspend fun buildPausedTaskOutcome(
+        session: SessionEntity,
+        stage: TaskStage,
+        partialResponse: String?
+    ): TaskCommandOutcome {
+        clearTaskPauseRequest(session.id)
+        val pausedSession = persistTaskSessionState(
+            session.copy(
+                taskStage = stage.name,
+                isTaskPaused = true,
+                taskPausedPartialResponse = partialResponse
+                    ?.trim()
+                    ?.ifBlank { null }
+            )
+        )
+        return TaskCommandOutcome(
+            updatedSession = pausedSession,
+            assistantMessages = emptyList()
+        )
+    }
+
+    private suspend fun handleTaskResume(
+        session: SessionEntity,
+        emitPartial: suspend (String) -> Unit
+    ): TaskCommandOutcome {
+        val stage = TaskStage.fromStored(session.taskStage)
+        val partialResponse = session.taskPausedPartialResponse
+            ?.trim()
+            ?.ifBlank { null }
+        val resumedSession = clearTaskPauseState(session)
+
+        fun singleResumeMessage(content: String): TaskCommandOutcome {
+            return TaskCommandOutcome(
+                updatedSession = resumedSession,
+                assistantMessages = listOf(
+                    StageAssistantMessage(
+                        stage = stage,
+                        content = content
+                    )
+                )
+            )
+        }
+
+        return when (stage) {
+            TaskStage.PLANNING -> {
+                val taskDescription = resumedSession.taskDescription
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply =
+                            "Не удалось возобновить planning: описание задачи отсутствует. Запустите /task <описание>."
+                        emitPartial(reply)
+                        return singleResumeMessage(reply)
+                    }
+                val userProfilePayload = resolveUserProfilePayload(resumedSession.userProfileName)
+                val generatedPlan = try {
+                    requestTaskPlanning(
+                        sessionId = resumedSession.id,
+                        taskDescription = taskDescription,
+                        userProfilePayload = userProfilePayload,
+                        replanReason = resumedSession.taskReplanReason,
+                        partialResponseSoFar = partialResponse,
+                        emitPartial = emitPartial
+                    )
+                } catch (paused: TaskStagePausedException) {
+                    return buildPausedTaskOutcome(
+                        session = resumedSession,
+                        stage = paused.stage,
+                        partialResponse = paused.partialResponse
+                    )
+                }
+                val planningReply = buildPlanningApprovalReply(
+                    plan = generatedPlan,
+                    replanReason = resumedSession.taskReplanReason
+                )
+                emitPartial(planningReply)
+                TaskCommandOutcome(
+                    updatedSession = resumedSession.copy(
+                        taskPlan = generatedPlan
+                    ),
+                    assistantMessages = listOf(
+                        StageAssistantMessage(
+                            stage = TaskStage.PLANNING,
+                            content = planningReply
+                        )
+                    )
+                )
+            }
+
+            TaskStage.EXECUTION -> {
+                val taskDescription = resumedSession.taskDescription
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply =
+                            "Не удалось возобновить execution: описание задачи отсутствует. Запустите /task <описание>."
+                        emitPartial(reply)
+                        return singleResumeMessage(reply)
+                    }
+                val approvedPlan = resumedSession.taskPlan
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply =
+                            "Не удалось возобновить execution: план отсутствует. Используйте /retry <причина>."
+                        emitPartial(reply)
+                        return singleResumeMessage(reply)
+                    }
+                val userProfilePayload = resolveUserProfilePayload(resumedSession.userProfileName)
+                runExecutionThenValidation(
+                    sessionId = resumedSession.id,
+                    executionStageSession = resumedSession,
+                    taskDescription = taskDescription,
+                    approvedPlan = approvedPlan,
+                    userProfilePayload = userProfilePayload,
+                    executionPartialResponse = partialResponse,
+                    emitPartial = emitPartial
+                )
+            }
+
+            TaskStage.VALIDATION -> {
+                val taskDescription = resumedSession.taskDescription
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply =
+                            "Не удалось возобновить validation: описание задачи отсутствует. Запустите /task <описание>."
+                        emitPartial(reply)
+                        return singleResumeMessage(reply)
+                    }
+                val approvedPlan = resumedSession.taskPlan
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply =
+                            "Не удалось возобновить validation: план отсутствует. Используйте /retry <причина>."
+                        emitPartial(reply)
+                        return singleResumeMessage(reply)
+                    }
+                val executionReport = resumedSession.taskExecutionReport
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        val reply =
+                            "Не удалось возобновить validation: отчёт execution отсутствует. Подтвердите план через /ok заново."
+                        emitPartial(reply)
+                        return singleResumeMessage(reply)
+                    }
+                val userProfilePayload = resolveUserProfilePayload(resumedSession.userProfileName)
+                runValidationAndFinalize(
+                    sessionId = resumedSession.id,
+                    validationStageSession = resumedSession.copy(
+                        taskExecutionReport = executionReport
+                    ),
+                    executionMessages = emptyList(),
+                    taskDescription = taskDescription,
+                    approvedPlan = approvedPlan,
+                    executionReport = executionReport,
+                    userProfilePayload = userProfilePayload,
+                    validationPartialResponse = partialResponse,
+                    emitPartial = emitPartial
+                )
+            }
+
+            TaskStage.DONE -> {
+                val doneReply = partialResponse ?: buildDoneStageReply(
+                    finalResult = resumedSession.taskFinalResult ?: ""
+                )
+                emitPartial(doneReply)
+                TaskCommandOutcome(
+                    updatedSession = resumedSession,
+                    assistantMessages = listOf(
+                        StageAssistantMessage(
+                            stage = TaskStage.DONE,
+                            content = doneReply
+                        )
+                    )
+                )
+            }
+
+            TaskStage.CONVERSATION -> {
+                val reply = "В conversation этапе нечего возобновлять."
+                emitPartial(reply)
+                singleResumeMessage(reply)
+            }
+        }
+    }
+
+    private suspend fun runExecutionThenValidation(
+        sessionId: String,
+        executionStageSession: SessionEntity,
+        taskDescription: String,
+        approvedPlan: String,
+        userProfilePayload: String?,
+        executionPartialResponse: String?,
+        emitPartial: suspend (String) -> Unit
+    ): TaskCommandOutcome {
+        val persistedExecutionMessageKeys = buildExecutionStreamingMessages(
+            executionPartialResponse.orEmpty()
+        )
+            .mapTo(mutableSetOf()) { buildStageMessageKey(it) }
+
+        val executionReport = try {
+            requestTaskExecution(
+                sessionId = sessionId,
+                taskDescription = taskDescription,
+                approvedPlan = approvedPlan,
+                userProfilePayload = userProfilePayload,
+                partialResponseSoFar = executionPartialResponse,
+                onExecutionMessage = { stageMessage ->
+                    val key = buildStageMessageKey(stageMessage)
+                    if (persistedExecutionMessageKeys.add(key)) {
+                        persistTaskAssistantMessage(sessionId, stageMessage)
+                    }
+                }
+            )
+        } catch (paused: TaskStagePausedException) {
+            return buildPausedTaskOutcome(
+                session = executionStageSession,
+                stage = paused.stage,
+                partialResponse = paused.partialResponse
+            )
+        }
+
+        val withExecution = clearTaskPauseState(executionStageSession).copy(
+            taskExecutionReport = executionReport
+        )
+        val executionMessages = buildExecutionStageMessages(executionReport)
+        executionMessages.forEach { stageMessage ->
+            val key = buildStageMessageKey(stageMessage)
+            if (persistedExecutionMessageKeys.add(key)) {
+                persistTaskAssistantMessage(sessionId, stageMessage)
+            }
+        }
+        val validationStageSession = persistTaskSessionState(
+            transitionTaskStage(
+                session = withExecution,
+                target = TaskStage.VALIDATION
+            )
+        )
+
+        return runValidationAndFinalize(
+            sessionId = sessionId,
+            validationStageSession = validationStageSession,
+            executionMessages = emptyList(),
+            taskDescription = taskDescription,
+            approvedPlan = approvedPlan,
+            executionReport = executionReport,
+            userProfilePayload = userProfilePayload,
+            validationPartialResponse = null,
+            emitPartial = emitPartial
+        )
+    }
+
+    private suspend fun runValidationAndFinalize(
+        sessionId: String,
+        validationStageSession: SessionEntity,
+        executionMessages: List<StageAssistantMessage>,
+        taskDescription: String,
+        approvedPlan: String,
+        executionReport: String,
+        userProfilePayload: String?,
+        validationPartialResponse: String?,
+        emitPartial: suspend (String) -> Unit
+    ): TaskCommandOutcome {
+        val validationReport = try {
+            requestTaskValidation(
+                sessionId = sessionId,
+                taskDescription = taskDescription,
+                approvedPlan = approvedPlan,
+                executionReport = executionReport,
+                userProfilePayload = userProfilePayload,
+                partialResponseSoFar = validationPartialResponse,
+                emitPartial = emitPartial
+            )
+        } catch (paused: TaskStagePausedException) {
+            return buildPausedTaskOutcome(
+                session = validationStageSession.copy(
+                    taskExecutionReport = executionReport
+                ),
+                stage = paused.stage,
+                partialResponse = paused.partialResponse
+            )
+        }
+        val withValidation = clearTaskPauseState(validationStageSession).copy(
+            taskExecutionReport = executionReport,
+            taskValidationReport = validationReport
+        )
+        val validationMessage = StageAssistantMessage(
+            stage = TaskStage.VALIDATION,
+            content = validationReport
+        )
+
+        val decision = parseValidationDecision(validationReport)
+        if (decision == ValidationDecision.SUCCESS) {
+            val finalResult = extractExecutionFinalResult(executionReport)
+            val doneSession = persistTaskSessionState(
+                transitionTaskStage(
+                    session = withValidation.copy(
+                        taskFinalResult = finalResult,
+                        taskReplanReason = null,
+                        taskAutoReplanCount = 0
+                    ),
+                    target = TaskStage.DONE
+                )
+            )
+            val doneReply = buildDoneStageReply(finalResult = finalResult)
+            if (isTaskPauseRequested(sessionId)) {
+                return buildPausedTaskOutcome(
+                    session = doneSession,
+                    stage = TaskStage.DONE,
+                    partialResponse = doneReply
+                )
+            }
+            emitPartial(doneReply)
+            return TaskCommandOutcome(
+                updatedSession = doneSession,
+                assistantMessages = executionMessages +
+                    listOf(
+                        validationMessage,
+                        StageAssistantMessage(
+                            stage = TaskStage.DONE,
+                            content = doneReply
+                        )
+                    )
+            )
+        }
+
+        val issues = extractValidationIssues(validationReport)
+            ?: DEFAULT_VALIDATION_REPLAN_REASON
+        val attempts = withValidation.taskAutoReplanCount + 1
+        if (attempts >= MAX_TASK_AUTO_REPLAN_ATTEMPTS) {
+            val doneSession = persistTaskSessionState(
+                transitionTaskStage(
+                    session = withValidation.copy(
+                        taskReplanReason = issues,
+                        taskAutoReplanCount = attempts
+                    ),
+                    target = TaskStage.DONE
+                )
+            )
+            val doneReply = buildAutoReplanLimitReachedReply(
+                issues = issues,
+                attempts = attempts
+            )
+            if (isTaskPauseRequested(sessionId)) {
+                return buildPausedTaskOutcome(
+                    session = doneSession,
+                    stage = TaskStage.DONE,
+                    partialResponse = doneReply
+                )
+            }
+            emitPartial(doneReply)
+            return TaskCommandOutcome(
+                updatedSession = doneSession,
+                assistantMessages = executionMessages +
+                    listOf(
+                        validationMessage,
+                        StageAssistantMessage(
+                            stage = TaskStage.DONE,
+                            content = doneReply
+                        )
+                    )
+            )
+        }
+
+        val planningStageSession = persistTaskSessionState(
+            transitionTaskStage(
+                session = withValidation.copy(
+                    taskReplanReason = issues,
+                    taskAutoReplanCount = attempts
+                ),
+                target = TaskStage.PLANNING
+            )
+        )
+        val replanned = try {
+            requestTaskPlanning(
+                sessionId = sessionId,
+                taskDescription = taskDescription,
+                userProfilePayload = userProfilePayload,
+                replanReason = issues,
+                partialResponseSoFar = null,
+                emitPartial = emitPartial
+            )
+        } catch (paused: TaskStagePausedException) {
+            return buildPausedTaskOutcome(
+                session = planningStageSession,
+                stage = paused.stage,
+                partialResponse = paused.partialResponse
+            )
+        }
+        val replannedReply = buildPlanningApprovalReply(
+            plan = replanned,
+            replanReason = issues
+        )
+        emitPartial(replannedReply)
+
+        return TaskCommandOutcome(
+            updatedSession = planningStageSession.copy(
+                taskPlan = replanned
+            ),
+            assistantMessages = executionMessages +
+                listOf(
+                    validationMessage,
+                    StageAssistantMessage(
+                        stage = TaskStage.PLANNING,
+                        content = replannedReply
+                    )
+                )
+        )
+    }
+
+    private suspend fun requestTaskPlanning(
+        sessionId: String,
+        taskDescription: String,
+        userProfilePayload: String?,
+        replanReason: String?,
+        partialResponseSoFar: String?,
+        emitPartial: suspend (String) -> Unit
+    ): String {
+        val payload = buildPlanningPayload(
+            taskDescription = taskDescription,
+            userProfilePayload = userProfilePayload,
+            replanReason = replanReason,
+            partialResponseSoFar = partialResponseSoFar
+        )
+        return requestSingleAssistantMessageStreaming(
+            sessionId = sessionId,
+            stage = TaskStage.PLANNING,
+            systemPrompt = TASK_PLANNING_SYSTEM_PROMPT,
+            userPayload = payload,
+            partialResponseSoFar = partialResponseSoFar,
+            emitPartial = emitPartial
+        )
+    }
+
+    private suspend fun requestTaskExecution(
+        sessionId: String,
+        taskDescription: String,
+        approvedPlan: String,
+        userProfilePayload: String?,
+        partialResponseSoFar: String?,
+        onExecutionMessage: suspend (StageAssistantMessage) -> Unit
+    ): String {
+        val payload = buildExecutionPayload(
+            taskDescription = taskDescription,
+            approvedPlan = approvedPlan,
+            userProfilePayload = userProfilePayload,
+            partialResponseSoFar = partialResponseSoFar
+        )
+        return requestTaskExecutionStreaming(
+            sessionId = sessionId,
+            userPayload = payload,
+            partialResponseSoFar = partialResponseSoFar,
+            onExecutionMessage = onExecutionMessage
+        )
+    }
+
+    private suspend fun requestTaskValidation(
+        sessionId: String,
+        taskDescription: String,
+        approvedPlan: String,
+        executionReport: String,
+        userProfilePayload: String?,
+        partialResponseSoFar: String?,
+        emitPartial: suspend (String) -> Unit
+    ): String {
+        val payload = buildValidationPayload(
+            taskDescription = taskDescription,
+            approvedPlan = approvedPlan,
+            executionReport = executionReport,
+            userProfilePayload = userProfilePayload,
+            partialResponseSoFar = partialResponseSoFar
+        )
+        return requestSingleAssistantMessageStreaming(
+            sessionId = sessionId,
+            stage = TaskStage.VALIDATION,
+            systemPrompt = TASK_VALIDATION_SYSTEM_PROMPT,
+            userPayload = payload,
+            partialResponseSoFar = partialResponseSoFar,
+            emitPartial = emitPartial
+        )
+    }
+
+    private suspend fun requestTaskExecutionStreaming(
+        sessionId: String,
+        userPayload: String,
+        partialResponseSoFar: String?,
+        onExecutionMessage: suspend (StageAssistantMessage) -> Unit
+    ): String {
+        val request = ChatCompletionRequest(
+            model = DEFAULT_MODEL,
+            messages = listOf(
+                ChatCompletionMessage(
+                    role = SYSTEM_ROLE,
+                    content = TASK_EXECUTION_SYSTEM_PROMPT
+                ),
+                ChatCompletionMessage(
+                    role = USER_ROLE,
+                    content = userPayload
+                )
+            ),
+            stream = true,
+            streamOptions = StreamOptions(includeUsage = false)
+        )
+
+        val partialPrefix = partialResponseSoFar
+            ?.trim()
+            ?.ifBlank { null }
+            .orEmpty()
+        var continuationText = ""
+        var finalAssistantText = partialPrefix
+        val emittedExecutionMessageKeys = buildExecutionStreamingMessages(partialPrefix)
+            .mapTo(mutableSetOf()) { buildStageMessageKey(it) }
+        if (isTaskPauseRequested(sessionId)) {
+            throw TaskStagePausedException(
+                stage = TaskStage.EXECUTION,
+                partialResponse = finalAssistantText.trim()
+            )
+        }
+        val statement = deepSeekApi.prepareStreamChatCompletions(request)
+        try {
+            statement.execute { response ->
+                val code = response.status.value
+                if (code !in 200..299) {
+                    val rawError = runCatching { response.bodyAsText() }.getOrNull()
+                    throw ChatApiException(buildApiErrorMessage(code = code, rawError = rawError))
+                }
+
+                val responseBody = response.bodyAsChannel()
+                sseStreamParser.streamEvents(responseBody).collect { event ->
+                    if (event is SseStreamEvent.Text) {
+                        continuationText = event.value
+                        finalAssistantText = partialPrefix + continuationText
+                        val streamingMessages = buildExecutionStreamingMessages(finalAssistantText)
+                        streamingMessages.forEach { stageMessage ->
+                            val key = buildStageMessageKey(stageMessage)
+                            if (emittedExecutionMessageKeys.add(key)) {
+                                onExecutionMessage(stageMessage)
+                            }
+                        }
+                        if (isTaskPauseRequested(sessionId)) {
+                            throw TaskStagePausedException(
+                                stage = TaskStage.EXECUTION,
+                                partialResponse = finalAssistantText.trim()
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            if (isTaskPauseRequested(sessionId)) {
+                throw TaskStagePausedException(
+                    stage = TaskStage.EXECUTION,
+                    partialResponse = finalAssistantText.trim()
+                )
+            }
+            throw cancelled
+        }
+
+        return finalAssistantText.trim()
+    }
+
+    private suspend fun requestSingleAssistantMessageStreaming(
+        sessionId: String,
+        stage: TaskStage,
+        systemPrompt: String,
+        userPayload: String,
+        partialResponseSoFar: String?,
+        emitPartial: suspend (String) -> Unit
+    ): String {
+        val request = ChatCompletionRequest(
+            model = DEFAULT_MODEL,
+            messages = listOf(
+                ChatCompletionMessage(
+                    role = SYSTEM_ROLE,
+                    content = systemPrompt
+                ),
+                ChatCompletionMessage(
+                    role = USER_ROLE,
+                    content = userPayload
+                )
+            ),
+            stream = true,
+            streamOptions = StreamOptions(includeUsage = false)
+        )
+
+        val partialPrefix = partialResponseSoFar
+            ?.trim()
+            ?.ifBlank { null }
+            .orEmpty()
+        var continuationText = ""
+        var finalAssistantText = partialPrefix
+        if (isTaskPauseRequested(sessionId)) {
+            throw TaskStagePausedException(
+                stage = stage,
+                partialResponse = finalAssistantText.trim()
+            )
+        }
+        val statement = deepSeekApi.prepareStreamChatCompletions(request)
+        try {
+            statement.execute { response ->
+                val code = response.status.value
+                if (code !in 200..299) {
+                    val rawError = runCatching { response.bodyAsText() }.getOrNull()
+                    throw ChatApiException(buildApiErrorMessage(code = code, rawError = rawError))
+                }
+
+                val responseBody = response.bodyAsChannel()
+                sseStreamParser.streamEvents(responseBody).collect { event ->
+                    if (event is SseStreamEvent.Text) {
+                        continuationText = event.value
+                        finalAssistantText = partialPrefix + continuationText
+                        if (finalAssistantText.isNotEmpty()) {
+                            emitPartial(finalAssistantText)
+                        }
+                        if (isTaskPauseRequested(sessionId)) {
+                            throw TaskStagePausedException(
+                                stage = stage,
+                                partialResponse = finalAssistantText.trim()
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            if (isTaskPauseRequested(sessionId)) {
+                throw TaskStagePausedException(
+                    stage = stage,
+                    partialResponse = finalAssistantText.trim()
+                )
+            }
+            throw cancelled
+        }
+
+        return finalAssistantText.trim()
+    }
+
+    private fun buildPlanningPayload(
+        taskDescription: String,
+        userProfilePayload: String?,
+        replanReason: String?,
+        partialResponseSoFar: String?
+    ): String {
+        return buildString {
+            append("USER TASK:\n")
+            append(taskDescription.trim())
+            append("\n\n")
+
+            if (!userProfilePayload.isNullOrBlank()) {
+                append("USER PROFILE:\n")
+                append(userProfilePayload.trim())
+                append("\n\n")
+            }
+
+            if (!replanReason.isNullOrBlank()) {
+                append("REPLAN REASON:\n")
+                append(replanReason.trim())
+            } else {
+                append("REPLAN REASON:\nNONE")
+            }
+            append("\n\n")
+            appendContinuationPayloadBlock(
+                container = this,
+                partialResponseSoFar = partialResponseSoFar
+            )
+        }
+    }
+
+    private fun buildExecutionPayload(
+        taskDescription: String,
+        approvedPlan: String,
+        userProfilePayload: String?,
+        partialResponseSoFar: String?
+    ): String {
+        return buildString {
+            append("USER TASK:\n")
+            append(taskDescription.trim())
+            append("\n\n")
+            append("APPROVED PLAN:\n")
+            append(approvedPlan.trim())
+            append("\n\n")
+            append("USER PROFILE:\n")
+            if (userProfilePayload.isNullOrBlank()) {
+                append("NONE")
+            } else {
+                append(userProfilePayload.trim())
+            }
+            append("\n\n")
+            appendContinuationPayloadBlock(
+                container = this,
+                partialResponseSoFar = partialResponseSoFar
+            )
+        }
+    }
+
+    private fun buildValidationPayload(
+        taskDescription: String,
+        approvedPlan: String,
+        executionReport: String,
+        userProfilePayload: String?,
+        partialResponseSoFar: String?
+    ): String {
+        return buildString {
+            append("USER TASK:\n")
+            append(taskDescription.trim())
+            append("\n\n")
+            append("APPROVED PLAN:\n")
+            append(approvedPlan.trim())
+            append("\n\n")
+            append("EXECUTION REPORT:\n")
+            append(executionReport.trim())
+            append("\n\n")
+            append("USER PROFILE:\n")
+            if (userProfilePayload.isNullOrBlank()) {
+                append("NONE")
+            } else {
+                append(userProfilePayload.trim())
+            }
+            append("\n\n")
+            appendContinuationPayloadBlock(
+                container = this,
+                partialResponseSoFar = partialResponseSoFar
+            )
+        }
+    }
+
+    private fun appendContinuationPayloadBlock(
+        container: StringBuilder,
+        partialResponseSoFar: String?
+    ) {
+        val normalizedPartial = partialResponseSoFar
+            ?.trim()
+            ?.ifBlank { null }
+        if (normalizedPartial == null) {
+            container.append("PARTIAL_RESPONSE_SO_FAR:\nNONE")
+            return
+        }
+
+        container.append("PARTIAL_RESPONSE_SO_FAR:\n")
+        container.append(normalizedPartial)
+        container.append("\n\n")
+        container.append("CONTINUE_INSTRUCTIONS:\n")
+        container.append("Continue strictly from the point where the partial response stopped. ")
+        container.append("Do not repeat already written content and keep the same output format.")
+    }
+
+    private fun parseValidationDecision(validationReport: String): ValidationDecision {
+        val decisionRegex = Regex(
+            pattern = "FINAL_DECISION:\\s*(SUCCESS|REPLAN_REQUIRED)",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val decision = decisionRegex.find(validationReport)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.uppercase()
+        return if (decision == "SUCCESS") {
+            ValidationDecision.SUCCESS
+        } else {
+            ValidationDecision.REPLAN_REQUIRED
+        }
+    }
+
+    private fun extractValidationIssues(validationReport: String): String? {
+        val issuesRegex = Regex(
+            pattern = "ISSUES_FOUND:\\s*(.*?)\\n\\s*RESULT_QUALITY:",
+            options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        val rawIssues = issuesRegex.find(validationReport)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            ?.ifBlank { null }
+            ?: return null
+        return if (rawIssues.equals("NONE", ignoreCase = true)) {
+            null
+        } else {
+            rawIssues
+        }
+    }
+
+    private fun extractExecutionFinalResult(executionReport: String): String {
+        val resultRegex = Regex(
+            pattern = "FINAL_RESULT:\\s*(.*?)\\n\\s*NEXT_STATE:",
+            options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        return resultRegex.find(executionReport)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            ?.ifBlank { null }
+            ?: executionReport.trim()
+    }
+
+    private fun buildExecutionStageMessages(executionReport: String): List<StageAssistantMessage> {
+        val parsed = parseExecutionReport(executionReport)
+        val messages = mutableListOf<StageAssistantMessage>()
+
+        messages += StageAssistantMessage(
+            stage = TaskStage.EXECUTION,
+            content = "STEPS_EXECUTED:"
+        )
+
+        if (parsed.steps.isEmpty()) {
+            messages += StageAssistantMessage(
+                stage = TaskStage.EXECUTION,
+                content = "(нет данных)"
+            )
+        } else {
+            parsed.steps.forEachIndexed { index, step ->
+                val stepNumber = step.step ?: (index + 1)
+                val stepTitle = step.description.ifBlank { "Шаг $stepNumber" }
+                val actionText = step.action.ifBlank { "—" }
+                val resultText = step.result.ifBlank { "—" }
+                val messageText = buildString {
+                    append("$stepNumber. $stepTitle")
+                    append("\nДействие: $actionText")
+                    append("\nРезультат: $resultText")
+                    val toolCall = step.toolCall?.trim().orEmpty()
+                    if (toolCall.isNotEmpty() && !toolCall.equals("NONE", ignoreCase = true)) {
+                        append("\nИнструмент: $toolCall")
+                    }
+                }
+                messages += StageAssistantMessage(
+                    stage = TaskStage.EXECUTION,
+                    content = messageText
+                )
+            }
+        }
+
+        messages += StageAssistantMessage(
+            stage = TaskStage.EXECUTION,
+            content = "FINAL_RESULT:\n${parsed.finalResult.ifBlank { "—" }}"
+        )
+
+        messages += StageAssistantMessage(
+            stage = TaskStage.EXECUTION,
+            content = "NEXT_STATE:\n${parsed.nextState?.ifBlank { "validation" } ?: "validation"}"
+        )
+
+        return messages
+    }
+
+    private fun buildExecutionStreamingMessages(executionReport: String): List<StageAssistantMessage> {
+        val partial = parseExecutionReportPartial(executionReport)
+        if (!partial.hasStructuredSections) {
+            return emptyList()
+        }
+
+        val messages = mutableListOf<StageAssistantMessage>()
+
+        if (partial.hasStepsSection) {
+            messages += StageAssistantMessage(
+                stage = TaskStage.EXECUTION,
+                content = "STEPS_EXECUTED:"
+            )
+            partial.steps.forEachIndexed { index, step ->
+                val stepNumber = step.step ?: (index + 1)
+                val stepTitle = step.description.ifBlank { "Шаг $stepNumber" }
+                val actionText = step.action.ifBlank { "—" }
+                val resultText = step.result.ifBlank { "—" }
+                val messageText = buildString {
+                    append("$stepNumber. $stepTitle")
+                    append("\nДействие: $actionText")
+                    append("\nРезультат: $resultText")
+                    val toolCall = step.toolCall?.trim().orEmpty()
+                    if (toolCall.isNotEmpty() && !toolCall.equals("NONE", ignoreCase = true)) {
+                        append("\nИнструмент: $toolCall")
+                    }
+                }
+                messages += StageAssistantMessage(
+                    stage = TaskStage.EXECUTION,
+                    content = messageText
+                )
+            }
+        }
+
+        if (
+            partial.hasFinalResultSection &&
+            partial.hasNextStateSection &&
+            partial.finalResult != null
+        ) {
+            messages += StageAssistantMessage(
+                stage = TaskStage.EXECUTION,
+                content = "FINAL_RESULT:\n${partial.finalResult}"
+            )
+        }
+
+        if (partial.hasNextStateSection && partial.nextState != null) {
+            messages += StageAssistantMessage(
+                stage = TaskStage.EXECUTION,
+                content = "NEXT_STATE:\n${partial.nextState}"
+            )
+        }
+
+        return messages
+    }
+
+    private fun parseExecutionReport(executionReport: String): ParsedExecutionReport {
+        val parsedSteps = parseExecutionStepsFromReport(executionReport)
+
+        return ParsedExecutionReport(
+            steps = parsedSteps,
+            finalResult = extractExecutionFinalResult(executionReport),
+            nextState = extractExecutionNextState(executionReport)
+        )
+    }
+
+    private fun parseExecutionReportPartial(executionReport: String): PartialExecutionReport {
+        val parsedSteps = parseExecutionStepsFromReport(
+            executionReport = executionReport,
+            requireCompleteFields = true
+        )
+        val hasFinalResultSection = FINAL_RESULT_MARKER_REGEX.containsMatchIn(executionReport)
+        val hasNextStateSection = NEXT_STATE_MARKER_REGEX.containsMatchIn(executionReport)
+
+        return PartialExecutionReport(
+            hasStepsSection = STEPS_EXECUTED_MARKER_REGEX.containsMatchIn(executionReport),
+            steps = parsedSteps,
+            hasFinalResultSection = hasFinalResultSection,
+            finalResult = extractExecutionFinalResultPartial(executionReport),
+            hasNextStateSection = hasNextStateSection,
+            nextState = extractExecutionNextState(executionReport),
+            hasStructuredSections = STEPS_EXECUTED_MARKER_REGEX.containsMatchIn(executionReport) ||
+                hasFinalResultSection ||
+                hasNextStateSection
+            )
+    }
+
+    private fun parseExecutionStepsFromReport(
+        executionReport: String,
+        requireCompleteFields: Boolean = false
+    ): List<ParsedExecutionStep> {
+        val strictParsed = extractExecutionStepsPayload(executionReport)
+            ?.let { payload ->
+                runCatching {
+                    json.parseToJsonElement(payload)
+                }.getOrNull() as? JsonArray
+            }
+            ?.mapNotNull { element ->
+                val objectPayload = element as? JsonObject ?: return@mapNotNull null
+                parseExecutionStepObject(
+                    stepObject = objectPayload,
+                    requireCompleteFields = requireCompleteFields
+                )
+            }
+            .orEmpty()
+        if (strictParsed.isNotEmpty()) return strictParsed
+
+        val stepsSection = extractExecutionStepsSection(executionReport) ?: return emptyList()
+        val tolerantCandidates = buildList {
+            addAll(extractBalancedStepCandidates(stepsSection))
+            addAll(extractAnchoredStepCandidates(stepsSection))
+        }
+            .map { sanitizeStepJsonCandidate(it) }
+            .distinct()
+
+        val tolerantParsed = tolerantCandidates
+            .mapNotNull { payload ->
+                parseExecutionStepPayload(
+                    stepPayload = payload,
+                    requireCompleteFields = requireCompleteFields
+                )
+            }
+        if (tolerantParsed.isEmpty()) return emptyList()
+
+        val deduplicated = mutableListOf<ParsedExecutionStep>()
+        val seenSignatures = mutableSetOf<String>()
+        tolerantParsed.forEach { step ->
+            val signature = buildString {
+                append(step.step ?: -1)
+                append('|')
+                append(step.description)
+                append('|')
+                append(step.action)
+                append('|')
+                append(step.result)
+                append('|')
+                append(step.toolCall.orEmpty())
+            }
+            if (seenSignatures.add(signature)) {
+                deduplicated += step
+            }
+        }
+        return deduplicated
+    }
+
+    private fun parseExecutionStepObject(
+        stepObject: JsonObject,
+        requireCompleteFields: Boolean
+    ): ParsedExecutionStep? {
+        val stepNumber = stepObject.readString("step")?.toIntOrNull()
+        val description = stepObject.readString("description").orEmpty()
+        val action = stepObject.readString("action").orEmpty()
+        val toolCall = stepObject.readString("tool_call")
+        val result = stepObject.readString("result").orEmpty()
+
+        if (
+            requireCompleteFields &&
+            (
+                stepNumber == null ||
+                    description.isBlank() ||
+                    action.isBlank() ||
+                    result.isBlank()
+                )
+        ) {
+            return null
+        }
+
+        if (stepNumber == null && description.isBlank() && action.isBlank() && result.isBlank()) {
+            return null
+        }
+
+        return ParsedExecutionStep(
+            step = stepNumber,
+            description = description,
+            action = action,
+            toolCall = toolCall,
+            result = result
+        )
+    }
+
+    private fun parseExecutionStepPayload(
+        stepPayload: String,
+        requireCompleteFields: Boolean
+    ): ParsedExecutionStep? {
+        val stepObject = runCatching {
+            json.parseToJsonElement(stepPayload)
+        }.getOrNull() as? JsonObject ?: return null
+
+        return parseExecutionStepObject(
+            stepObject = stepObject,
+            requireCompleteFields = requireCompleteFields
+        )
+    }
+
+    private fun extractExecutionStepsSection(executionReport: String): String? {
+        val markerIndex = STEPS_EXECUTED_MARKER_REGEX.find(executionReport)
+            ?.range
+            ?.last
+            ?.plus(1)
+            ?: return null
+        val finalResultStart = FINAL_RESULT_MARKER_REGEX.find(
+            input = executionReport,
+            startIndex = markerIndex
+        )?.range?.first
+        val nextStateStart = NEXT_STATE_MARKER_REGEX.find(
+            input = executionReport,
+            startIndex = markerIndex
+        )?.range?.first
+        val sectionEnd = listOfNotNull(finalResultStart, nextStateStart).minOrNull()
+            ?: executionReport.length
+        if (sectionEnd <= markerIndex) return null
+        return executionReport.substring(markerIndex, sectionEnd)
+    }
+
+    private fun extractBalancedStepCandidates(stepsSection: String): List<String> {
+        val startIndex = stepsSection.indexOf('[').let { index ->
+            if (index >= 0) index + 1 else 0
+        }
+
+        val completedObjects = mutableListOf<String>()
+        var depth = 0
+        var inQuotes = false
+        var escaped = false
+        var objectStart = -1
+
+        for (index in startIndex until stepsSection.length) {
+            val current = stepsSection[index]
+
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            if (current == '\\') {
+                escaped = true
+                continue
+            }
+            if (current == '"') {
+                inQuotes = !inQuotes
+                continue
+            }
+            if (inQuotes) continue
+
+            when (current) {
+                '{' -> {
+                    if (depth == 0) {
+                        objectStart = index
+                    }
+                    depth += 1
+                }
+
+                '}' -> {
+                    if (depth <= 0) continue
+                    depth -= 1
+                    if (depth == 0 && objectStart >= 0) {
+                        completedObjects += stepsSection.substring(objectStart, index + 1)
+                        objectStart = -1
+                    }
+                }
+
+                ']' -> {
+                    if (depth == 0) break
+                }
+            }
+        }
+
+        return completedObjects
+    }
+
+    private fun extractAnchoredStepCandidates(stepsSection: String): List<String> {
+        val stepAnchors = STEP_KEY_ANCHOR_REGEX.findAll(stepsSection)
+            .map { it.range.first }
+            .toList()
+        if (stepAnchors.isEmpty()) return emptyList()
+
+        val candidates = mutableListOf<String>()
+        stepAnchors.forEachIndexed { index, anchor ->
+            val previousAnchor = stepAnchors.getOrNull(index - 1) ?: -1
+            val nextAnchor = stepAnchors.getOrNull(index + 1) ?: stepsSection.length
+            val objectStart = stepsSection.lastIndexOf('{', startIndex = anchor)
+                .takeIf { it >= 0 && it > previousAnchor }
+                ?: anchor
+            val closingBrace = findCandidateClosingBrace(
+                stepsSection = stepsSection,
+                anchor = anchor,
+                nextAnchor = nextAnchor
+            ) ?: return@forEachIndexed
+
+            if (closingBrace < objectStart) return@forEachIndexed
+            var candidate = stepsSection.substring(objectStart, closingBrace + 1)
+            if (!candidate.trimStart().startsWith("{")) {
+                candidate = "{${candidate.trimStart()}"
+            }
+            if (!candidate.trimEnd().endsWith("}")) {
+                candidate = "${candidate.trimEnd()}}"
+            }
+            candidates += candidate
+        }
+        return candidates
+    }
+
+    private fun findCandidateClosingBrace(
+        stepsSection: String,
+        anchor: Int,
+        nextAnchor: Int
+    ): Int? {
+        var inQuotes = false
+        var escaped = false
+        for (index in anchor until stepsSection.length) {
+            val current = stepsSection[index]
+
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            if (current == '\\') {
+                escaped = true
+                continue
+            }
+            if (current == '"') {
+                inQuotes = !inQuotes
+                continue
+            }
+            if (inQuotes) continue
+
+            if (current == '}') return index
+            if (index >= nextAnchor && current == '{') return null
+        }
+        return null
+    }
+
+    private fun sanitizeStepJsonCandidate(candidate: String): String {
+        val normalized = candidate
+            .trim()
+            .trimStart(',')
+            .trim()
+        val withBraces = buildString {
+            if (!normalized.startsWith("{")) append('{')
+            append(normalized)
+            if (!normalized.endsWith("}")) append('}')
+        }
+        return withBraces.replace(TRAILING_COMMA_BEFORE_BRACE_REGEX, "$1")
+    }
+
+    private fun extractExecutionFinalResultPartial(executionReport: String): String? {
+        val finalResultMatch = FINAL_RESULT_MARKER_REGEX.find(executionReport) ?: return null
+        val contentStart = finalResultMatch.range.last + 1
+        val nextStateMatch = NEXT_STATE_MARKER_REGEX.find(
+            input = executionReport,
+            startIndex = contentStart
+        )
+        val contentEnd = nextStateMatch?.range?.first ?: executionReport.length
+        if (contentEnd <= contentStart) return null
+
+        return executionReport.substring(contentStart, contentEnd)
+            .trim()
+            .ifBlank { null }
+    }
+
+    private fun extractExecutionStepsPayload(executionReport: String): String? {
+        val markerIndex = STEPS_EXECUTED_MARKER_REGEX.find(executionReport)
+            ?.range
+            ?.last
+            ?.plus(1)
+            ?: return null
+        val arrayStart = executionReport.indexOf('[', startIndex = markerIndex)
+        if (arrayStart < 0) return null
+        return extractBalancedBlock(
+            payload = executionReport,
+            startIndex = arrayStart,
+            openChar = '[',
+            closeChar = ']'
+        )
+    }
+
+    private fun extractExecutionNextState(executionReport: String): String? {
+        return NEXT_STATE_VALUE_REGEX.find(executionReport)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim()
+            ?.ifBlank { null }
+            ?.lowercase()
+    }
+
+    private fun extractBalancedBlock(
+        payload: String,
+        startIndex: Int,
+        openChar: Char,
+        closeChar: Char
+    ): String? {
+        if (startIndex !in payload.indices || payload[startIndex] != openChar) return null
+
+        var depth = 0
+        var inQuotes = false
+        var escaped = false
+        for (index in startIndex until payload.length) {
+            val current = payload[index]
+
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            if (current == '\\') {
+                escaped = true
+                continue
+            }
+            if (current == '"') {
+                inQuotes = !inQuotes
+                continue
+            }
+            if (inQuotes) continue
+
+            if (current == openChar) depth += 1
+            if (current == closeChar) {
+                depth -= 1
+                if (depth == 0) {
+                    return payload.substring(startIndex, index + 1)
+                }
+            }
+        }
+
+        return null
+    }
+
+    private fun JsonObject.readString(key: String): String? {
+        val element = this[key] ?: return null
+        return when (element) {
+            is JsonPrimitive -> element.contentOrNull?.trim()
+            else -> element.toString().trim()
+        }?.ifBlank { null }
+    }
+
+    private fun buildPlanningApprovalReply(
+        plan: String,
+        replanReason: String? = null
+    ): String {
+        return buildString {
+            if (!replanReason.isNullOrBlank()) {
+                append("Перепланировал с учетом замечаний:\n")
+                append(replanReason.trim())
+                append("\n\n")
+            }
+            append(plan.trim())
+            append("\n\n")
+            append("Подтвердите план: /ok\n")
+            append("Попросить перепланировать: /retry <что исправить>")
+        }
+    }
+
+    private fun buildDoneStageReply(finalResult: String): String {
+        return buildString {
+            append("Итоговое решение:\n")
+            append(finalResult.trim())
+            append("\n\n")
+            append("Задача выполнена?\n")
+            append("Ответьте /ok или /err <что не так>")
+        }
+    }
+
+    private fun buildAutoReplanLimitReachedReply(issues: String, attempts: Int): String {
+        return buildString {
+            append("Достигнут лимит автоперепланирования ($attempts).\n")
+            append("Последняя причина валидации:\n")
+            append(issues.trim())
+            append("\n\n")
+            append("Если задача не принята, ответьте /err <что исправить>.\n")
+            append("Если все ок, ответьте /ok.")
+        }
+    }
+
+    private fun buildInvalidTaskCommandReply(stage: TaskStage): String {
+        return when (stage) {
+            TaskStage.CONVERSATION -> "Для запуска задачи используйте /task <описание>."
+            TaskStage.PLANNING ->
+                "Сейчас этап planning. Доступно: /ok или /retry <что исправить>."
+            TaskStage.EXECUTION ->
+                "Сейчас этап execution. Дождитесь завершения выполнения."
+            TaskStage.VALIDATION ->
+                "Сейчас этап validation. Дождитесь завершения проверки."
+            TaskStage.DONE ->
+                "Сейчас этап done. Ответьте /ok или /err <что не так>."
+        }
+    }
+
+    private fun buildTaskStageInputHint(stage: TaskStage): String {
+        return when (stage) {
+            TaskStage.CONVERSATION ->
+                "Обычный режим диалога."
+            TaskStage.PLANNING ->
+                "Сейчас этап planning. Подтвердите план через /ok или отправьте /retry <причина>."
+            TaskStage.EXECUTION ->
+                "Сейчас этап execution. Дождитесь завершения."
+            TaskStage.VALIDATION ->
+                "Сейчас этап validation. Дождитесь завершения."
+            TaskStage.DONE ->
+                "Сейчас этап done. Ответьте /ok или /err <что не так>."
+        }
+    }
+
     private fun parseControlCommand(content: String): ChatControlCommand? {
         parseMemoryCommand(content)?.let { return ChatControlCommand.Memory(it) }
         parseWorkCommand(content)?.let { return ChatControlCommand.Work(it) }
+        parseTaskCommand(content)?.let { return ChatControlCommand.Task(it) }
         return null
     }
 
@@ -1228,6 +3077,52 @@ class ChatDataSourceImpl(
 
             else -> WorkCommand.Invalid(WORK_COMMAND_HELP)
         }
+    }
+
+    private fun parseTaskCommand(content: String): TaskCommand? {
+        val trimmed = content.trim()
+        if (!trimmed.startsWith("/")) return null
+
+        if (trimmed == TASK_COMMAND_OK) {
+            return TaskCommand.Approve
+        }
+        if (trimmed.startsWith("$TASK_COMMAND_OK ")) {
+            return TaskCommand.Invalid("Команда /ok не принимает аргументы")
+        }
+        if (trimmed == TASK_COMMAND_RETRY) {
+            return TaskCommand.Invalid("Укажи причину после /retry")
+        }
+        if (trimmed.startsWith("$TASK_COMMAND_RETRY ")) {
+            val reason = trimmed.removePrefix(TASK_COMMAND_RETRY).trim()
+            return if (reason.isEmpty()) {
+                TaskCommand.Invalid("Укажи причину после /retry")
+            } else {
+                TaskCommand.Retry(reason)
+            }
+        }
+        if (trimmed == TASK_COMMAND_ERR) {
+            return TaskCommand.Invalid("Укажи причину после /err")
+        }
+        if (trimmed.startsWith("$TASK_COMMAND_ERR ")) {
+            val reason = trimmed.removePrefix(TASK_COMMAND_ERR).trim()
+            return if (reason.isEmpty()) {
+                TaskCommand.Invalid("Укажи причину после /err")
+            } else {
+                TaskCommand.Error(reason)
+            }
+        }
+        if (trimmed == TASK_COMMAND_START) {
+            return TaskCommand.Invalid("Укажи описание после /task")
+        }
+        if (trimmed.startsWith("$TASK_COMMAND_START ")) {
+            val description = trimmed.removePrefix(TASK_COMMAND_START).trim()
+            return if (description.isEmpty()) {
+                TaskCommand.Invalid("Укажи описание после /task")
+            } else {
+                TaskCommand.Start(description)
+            }
+        }
+        return null
     }
 
     private fun parseLongTermMemoryInstructions(memoryJson: String?): List<String> {
@@ -1333,16 +3228,23 @@ class ChatDataSourceImpl(
         baseSystemPrompt: String?,
         userProfilePayload: String?,
         memoryInstructions: List<String>,
-        currentWorkTask: WorkTaskContext
+        currentWorkTask: WorkTaskContext,
+        taskDescription: String?,
+        taskFinalResult: String?
     ): String? {
         val userProfilePrompt = buildUserProfileSystemPrompt(userProfilePayload)
         val memoryPrompt = buildMemorySystemPrompt(memoryInstructions)
         val workTaskPrompt = buildWorkTaskSystemPrompt(currentWorkTask)
+        val taskSummaryPrompt = buildTaskSummarySystemPrompt(
+            taskDescription = taskDescription,
+            taskFinalResult = taskFinalResult
+        )
         val parts = buildList {
             baseSystemPrompt?.let { add(it) }
             userProfilePrompt?.let { add(it) }
             add(memoryPrompt)
             add(workTaskPrompt)
+            taskSummaryPrompt?.let { add(it) }
         }
         return parts.joinToString(separator = "\n\n")
     }
@@ -1407,6 +3309,31 @@ class ChatDataSourceImpl(
         }
     }
 
+    private fun buildTaskSummarySystemPrompt(
+        taskDescription: String?,
+        taskFinalResult: String?
+    ): String? {
+        val normalizedTaskDescription = taskDescription?.trim()?.ifBlank { null }
+        val normalizedTaskFinalResult = taskFinalResult?.trim()?.ifBlank { null }
+        if (normalizedTaskDescription == null && normalizedTaskFinalResult == null) {
+            return null
+        }
+
+        return buildString {
+            append(TASK_SUMMARY_SECTION_TITLE)
+            normalizedTaskDescription?.let {
+                append("\nTask:")
+                append('\n')
+                append(it)
+            }
+            normalizedTaskFinalResult?.let {
+                append("\nResult:")
+                append('\n')
+                append(it)
+            }
+        }
+    }
+
     private fun buildMemoryShowReply(instructions: List<String>): String {
         if (instructions.isEmpty()) return MEMORY_EMPTY_REPLY
 
@@ -1453,27 +3380,7 @@ class ChatDataSourceImpl(
     }
 
     private fun List<MessageEntity>.filterControlCommandMessagesForModelContext(): List<MessageEntity> {
-        if (isEmpty()) return emptyList()
-
-        val filtered = ArrayList<MessageEntity>(size)
-        var skipNextAssistant = false
-        for (message in this) {
-            val role = MessageRole.fromStored(message.role)
-
-            if (skipNextAssistant && role == MessageRole.ASSISTANT) {
-                skipNextAssistant = false
-                continue
-            }
-            skipNextAssistant = false
-
-            if (role == MessageRole.USER && parseControlCommand(message.content) != null) {
-                skipNextAssistant = true
-                continue
-            }
-
-            filtered += message
-        }
-        return filtered
+        return filter { it.includeInModelContext }
     }
 
     private fun List<MessageEntity>.toApiMessages(): List<ChatCompletionMessage> {
@@ -1686,11 +3593,42 @@ class ChatDataSourceImpl(
         const val WORK_COMMAND_HELP =
             "Команды задачи: /work start <задача>, /work done, /work rule <правило>, /work delete <номер>, /work show"
 
+        const val TASK_COMMAND_START = "/task"
+        const val TASK_COMMAND_OK = "/ok"
+        const val TASK_COMMAND_RETRY = "/retry"
+        const val TASK_COMMAND_ERR = "/err"
+        const val MAX_TASK_AUTO_REPLAN_ATTEMPTS = 3
+        const val DEFAULT_VALIDATION_REPLAN_REASON = "Validation reported unresolved issues."
+        const val TASK_PAUSE_CANCELLATION_REASON = "TASK_PAUSED"
+        const val TASK_PAUSED_HINT = "Процесс задачи на паузе. Нажмите «Продолжить»."
+        val STEPS_EXECUTED_MARKER_REGEX = Regex(
+            pattern = "STEPS_EXECUTED\\s*:",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val FINAL_RESULT_MARKER_REGEX = Regex(
+            pattern = "FINAL_RESULT\\s*:",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val NEXT_STATE_MARKER_REGEX = Regex(
+            pattern = "NEXT_STATE\\s*:",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val NEXT_STATE_VALUE_REGEX = Regex(
+            pattern = "NEXT_STATE\\s*:\\s*([^\\n\\r]+)",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val STEP_KEY_ANCHOR_REGEX = Regex(
+            pattern = "\"step\"\\s*:",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
+        val TRAILING_COMMA_BEFORE_BRACE_REGEX = Regex(",\\s*([}\\]])")
+
         const val WORK_TASK_STATUS_KEY = "status"
         const val WORK_TASK_STATUS_ACTIVE = "ACTIVE"
         const val WORK_TASK_STATUS_DONE = "DONE"
         const val WORK_TASK_DESCRIPTION_KEY = "description"
         const val WORK_TASK_RULES_KEY = "rules"
+        const val TASK_SUMMARY_SECTION_TITLE = "[TASK CONTEXT]"
 
         const val CONTEXT_TAIL_MESSAGES_COUNT = 10
         const val SUMMARY_BATCH_SIZE = 10
@@ -1703,6 +3641,174 @@ class ChatDataSourceImpl(
         const val SUMMARY_COMPRESSION_SYSTEM_PROMPT =
             "Ты модуль сжатия истории чата. Выдавай плотное summary без воды. " +
                 "Сохраняй факты, намерения пользователя, ограничения, решения и открытые вопросы."
+
+        val TASK_PLANNING_SYSTEM_PROMPT = """
+            You are an AI agent currently in the PLANNING stage of a task execution state machine.
+
+            Your goal is to create a clear and structured plan for solving the user's task.
+
+            IMPORTANT RULES:
+            - Do NOT execute the task.
+            - Do NOT produce the final answer.
+            - Do NOT call tools.
+            - Only analyze the task and produce a step-by-step plan.
+
+            Your responsibilities in the planning stage:
+
+            1. Understand the user's objective.
+            2. Identify required information or resources.
+            3. Break the task into logical steps.
+            4. Determine which tools or capabilities may be needed.
+            5. Define the expected output.
+            6. Identify possible risks or ambiguities.
+            7. Decide what validation will be required after execution.
+
+            Output a structured plan in the following format:
+
+            TASK SUMMARY:
+            Short description of the user's goal.
+
+            PLAN:
+            1. Step description
+            2. Step description
+            3. Step description
+            ...
+
+            REQUIRED TOOLS:
+            - tool_name — why it may be needed
+            - tool_name — why it may be needed
+
+            EXPECTED OUTPUT:
+            Description of what a successful result should look like.
+
+            VALIDATION STRATEGY:
+            How the result will be checked for correctness.
+
+            CONSTRAINTS:
+            Any assumptions, limitations, or missing information.
+
+            Remember:
+            You are ONLY planning. Execution will happen in the next stage.
+        """.trimIndent()
+
+        val TASK_EXECUTION_SYSTEM_PROMPT = """
+            You are an AI agent currently in the EXECUTION stage of a task execution state machine.
+
+            Your goal is to execute the FULL plan that was produced during the PLANNING stage.
+
+            INPUTS:
+            - User task
+            - Execution plan generated in the PLANNING stage
+            - User profile
+
+            IMPORTANT RULES:
+
+            - Execute the entire plan step-by-step.
+            - Follow the order of steps exactly as specified.
+            - Do not modify the plan.
+            - Do not re-plan the task.
+            - Do not skip steps.
+            - If a step produces intermediate data, keep it and use it in subsequent steps.
+            - Do not evaluate correctness of the final result — this will be done in the VALIDATION stage.
+
+            Execution procedure:
+
+            1. Read the plan.
+            2. Execute each step sequentially.
+            3. Record the result of every step.
+            4. Produce the final result based on all executed steps.
+            5. Return the execution report.
+
+            Output format:
+
+            EXECUTION_REPORT:
+
+            STEPS_EXECUTED:
+            [
+              {
+                "step": 1,
+                "description": "...",
+                "action": "...",
+                "tool_call": "... or NONE",
+                "result": "..."
+              },
+              {
+                "step": 2,
+                "description": "...",
+                "action": "...",
+                "tool_call": "... or NONE",
+                "result": "..."
+              }
+            ]
+
+            FINAL_RESULT:
+            The result produced after completing all steps.
+
+            NEXT_STATE:
+            validation
+        """.trimIndent()
+
+        val TASK_VALIDATION_SYSTEM_PROMPT = """
+            You are an AI agent currently in the VALIDATION stage of a task execution state machine.
+
+            Your goal is to evaluate whether the execution result correctly solves the user's task.
+
+            INPUTS:
+            - User task
+            - Execution plan
+            - Execution report (steps executed and final result)
+            - User profile
+
+            IMPORTANT RULES:
+
+            - Do NOT execute the task again.
+            - Do NOT call tools.
+            - Do NOT modify the execution results.
+            - Only analyze and evaluate the result.
+
+            Your responsibilities:
+
+            1. Check whether the execution followed the plan.
+            2. Verify that the final result satisfies the user's request.
+            3. Detect logical errors, missing steps, or incorrect reasoning.
+            4. Check whether the output format matches expectations.
+            5. Identify hallucinations or unsupported claims.
+            6. Determine whether the task is completed successfully.
+
+            Validation procedure:
+
+            1. Compare the user task with the final result.
+            2. Review each executed step.
+            3. Check logical consistency.
+            4. Decide whether the result is acceptable.
+
+            Output format:
+
+            VALIDATION_REPORT:
+
+            TASK_MATCH:
+            Does the final result solve the user's task?
+            YES | PARTIALLY | NO
+
+            PLAN_EXECUTION_CHECK:
+            Did the execution follow the plan correctly?
+            YES | NO
+
+            ISSUES_FOUND:
+            List any detected problems. If none, write "NONE".
+
+            RESULT_QUALITY:
+            HIGH | MEDIUM | LOW
+
+            FINAL_DECISION:
+            SUCCESS | REPLAN_REQUIRED
+
+            REASONING:
+            Short explanation of the decision.
+
+            NEXT_STATE:
+            done | planning
+        """.trimIndent()
 
         val USER_PROFILE_BUILDER_SYSTEM_PROMPT = """
             Ты ассистент, который помогает пользователю собрать USER_PROFILE для чата.
@@ -1816,6 +3922,11 @@ private suspend inline fun <T> AppDatabase.withTransactionCompat(
 
 private class ChatApiException(message: String) : RuntimeException(message)
 
+private class TaskStagePausedException(
+    val stage: TaskStage,
+    val partialResponse: String
+) : RuntimeException("Task stage ${stage.name} paused")
+
 private data class PromptUsage(
     val promptTokens: Int,
     val promptCacheHitTokens: Int,
@@ -1838,9 +3949,18 @@ private sealed interface WorkCommand {
     data class Invalid(val reply: String) : WorkCommand
 }
 
+private sealed interface TaskCommand {
+    data class Start(val description: String) : TaskCommand
+    object Approve : TaskCommand
+    data class Retry(val reason: String) : TaskCommand
+    data class Error(val reason: String) : TaskCommand
+    data class Invalid(val reply: String) : TaskCommand
+}
+
 private sealed interface ChatControlCommand {
     data class Memory(val command: MemoryCommand) : ChatControlCommand
     data class Work(val command: WorkCommand) : ChatControlCommand
+    data class Task(val command: TaskCommand) : ChatControlCommand
 }
 
 private data class WorkTaskState(
@@ -1859,4 +3979,43 @@ private data class ControlCommandResponse(
     val memoryInstructions: List<String>? = null,
     val workTaskChanged: Boolean = false,
     val workTaskContext: WorkTaskContext? = null
+)
+
+private enum class ValidationDecision {
+    SUCCESS,
+    REPLAN_REQUIRED
+}
+
+private data class StageAssistantMessage(
+    val stage: TaskStage,
+    val content: String
+)
+
+private data class TaskCommandOutcome(
+    val updatedSession: SessionEntity,
+    val assistantMessages: List<StageAssistantMessage>
+)
+
+private data class ParsedExecutionReport(
+    val steps: List<ParsedExecutionStep>,
+    val finalResult: String,
+    val nextState: String?
+)
+
+private data class PartialExecutionReport(
+    val hasStepsSection: Boolean,
+    val steps: List<ParsedExecutionStep>,
+    val hasFinalResultSection: Boolean,
+    val finalResult: String?,
+    val hasNextStateSection: Boolean,
+    val nextState: String?,
+    val hasStructuredSections: Boolean
+)
+
+private data class ParsedExecutionStep(
+    val step: Int?,
+    val description: String,
+    val action: String,
+    val toolCall: String?,
+    val result: String
 )

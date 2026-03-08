@@ -7,6 +7,7 @@ import com.pokkerolli.codeagent.domain.model.ChatMessage
 import com.pokkerolli.codeagent.domain.model.ChatSession
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
 import com.pokkerolli.codeagent.domain.model.MessageRole
+import com.pokkerolli.codeagent.domain.model.TaskStage
 import com.pokkerolli.codeagent.domain.model.UserProfilePreset
 
 fun SessionEntity.toDomain(): ChatSession {
@@ -21,7 +22,11 @@ fun SessionEntity.toDomain(): ChatSession {
         isStickyFactsExtractionInProgress = isStickyFactsExtractionInProgress,
         contextSummary = contextSummary,
         summarizedMessagesCount = summarizedMessagesCount,
-        isContextSummarizationInProgress = isContextSummarizationInProgress
+        isContextSummarizationInProgress = isContextSummarizationInProgress,
+        taskStage = TaskStage.fromStored(taskStage),
+        taskDescription = taskDescription,
+        taskFinalResult = taskFinalResult,
+        isTaskPaused = isTaskPaused
     )
 }
 
@@ -30,6 +35,7 @@ fun MessageEntity.toDomain(): ChatMessage {
         id = id,
         sessionId = sessionId,
         role = MessageRole.fromStored(role),
+        taskStage = TaskStage.fromStored(taskStage),
         content = content,
         timestamp = createdAt,
         promptTokens = promptTokens,

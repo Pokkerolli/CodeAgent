@@ -18,5 +18,15 @@ data class SessionEntity(
     val isStickyFactsExtractionInProgress: Boolean = false,
     val contextSummary: String? = null,
     val summarizedMessagesCount: Int = 0,
-    val isContextSummarizationInProgress: Boolean = false
+    val isContextSummarizationInProgress: Boolean = false,
+    val taskStage: String = "CONVERSATION",
+    val taskDescription: String? = null,
+    val taskPlan: String? = null,
+    val taskExecutionReport: String? = null,
+    val taskValidationReport: String? = null,
+    val taskFinalResult: String? = null,
+    val taskReplanReason: String? = null,
+    val taskAutoReplanCount: Int = 0,
+    val isTaskPaused: Boolean = false,
+    val taskPausedPartialResponse: String? = null
 )

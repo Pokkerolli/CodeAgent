@@ -24,6 +24,8 @@ data class MessageEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val sessionId: String,
     val role: String,
+    val taskStage: String = "CONVERSATION",
+    val includeInModelContext: Boolean = true,
     val content: String,
     val createdAt: Long,
     val promptTokens: Int? = null,

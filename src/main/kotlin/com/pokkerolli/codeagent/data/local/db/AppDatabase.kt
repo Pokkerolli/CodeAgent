@@ -11,7 +11,7 @@ import com.pokkerolli.codeagent.data.local.entity.UserProfilePresetEntity
 
 @Database(
     entities = [SessionEntity::class, MessageEntity::class, UserProfilePresetEntity::class],
-    version = 15,
+    version = 17,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
