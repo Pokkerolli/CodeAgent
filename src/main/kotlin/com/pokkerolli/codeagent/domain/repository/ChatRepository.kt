@@ -107,6 +107,10 @@ class ChatRepository(
         )
     }
 
+    suspend fun loadAvailableTools(sessionId: String) {
+        dataSource.loadAvailableTools(sessionId)
+    }
+
     suspend fun requestTaskPause(sessionId: String) {
         dataSource.requestTaskPause(sessionId)
     }

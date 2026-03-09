@@ -73,6 +73,7 @@ data class ChatUiState(
     val activeSessionTaskStage: TaskStage = TaskStage.CONVERSATION,
     val activeSessionInvariantCheckEnabled: Boolean = false,
     val activeSessionTaskPaused: Boolean = false,
+    val isLoadingAvailableTools: Boolean = false,
     val invariantRules: List<InvariantRuleUi> = emptyList(),
     val isInvariantEnableDialogVisible: Boolean = false,
     val messages: List<ChatMessageUi> = emptyList(),

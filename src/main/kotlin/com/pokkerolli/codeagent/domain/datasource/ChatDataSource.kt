@@ -32,6 +32,7 @@ interface ChatDataSource {
     suspend fun runContextSummarizationIfNeeded(sessionId: String)
     fun observeActiveSessionId(): Flow<String?>
     fun sendMessageStreaming(sessionId: String, content: String): Flow<String>
+    suspend fun loadAvailableTools(sessionId: String)
     suspend fun requestTaskPause(sessionId: String)
     fun resumeTaskStreaming(sessionId: String): Flow<String>
 }

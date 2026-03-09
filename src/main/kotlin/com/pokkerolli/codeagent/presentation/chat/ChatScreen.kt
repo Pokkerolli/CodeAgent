@@ -93,6 +93,7 @@ fun ChatRoute(
         onOpenInvariantEnableDialog = viewModel::onOpenInvariantEnableDialog,
         onDismissInvariantEnableDialog = viewModel::onDismissInvariantEnableDialog,
         onConfirmInvariantEnableDialog = viewModel::onConfirmInvariantEnableDialog,
+        onLoadAvailableToolsClick = viewModel::onLoadAvailableToolsClicked,
         onSystemPromptSelected = viewModel::onSystemPromptSelected,
         onUserProfileSelected = viewModel::onUserProfileSelected,
         onOpenCustomProfileBuilder = viewModel::onOpenCustomProfileBuilder,
@@ -119,6 +120,7 @@ private fun ChatScreen(
     onOpenInvariantEnableDialog: () -> Unit,
     onDismissInvariantEnableDialog: () -> Unit,
     onConfirmInvariantEnableDialog: () -> Unit,
+    onLoadAvailableToolsClick: () -> Unit,
     onSystemPromptSelected: (String) -> Unit,
     onUserProfileSelected: (String?) -> Unit,
     onOpenCustomProfileBuilder: () -> Unit,
@@ -270,8 +272,10 @@ private fun ChatScreen(
                     currentTaskStage = state.activeSessionTaskStage,
                     isInvariantCheckEnabled = state.activeSessionInvariantCheckEnabled,
                     isTaskPaused = state.activeSessionTaskPaused,
+                    isLoadingAvailableTools = state.isLoadingAvailableTools,
                     onTaskPauseResumeClick = onTaskPauseResumeClick,
-                    onEnableInvariantClick = onOpenInvariantEnableDialog
+                    onEnableInvariantClick = onOpenInvariantEnableDialog,
+                    onLoadAvailableToolsClick = onLoadAvailableToolsClick
                 )
 
                 LazyColumn(
@@ -327,8 +331,10 @@ private fun ConversationUsagePanel(
     currentTaskStage: TaskStage,
     isInvariantCheckEnabled: Boolean,
     isTaskPaused: Boolean,
+    isLoadingAvailableTools: Boolean,
     onTaskPauseResumeClick: () -> Unit,
     onEnableInvariantClick: () -> Unit,
+    onLoadAvailableToolsClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -374,17 +380,33 @@ private fun ConversationUsagePanel(
                     }
                 }
 
-                TextButton(
-                    onClick = onEnableInvariantClick,
-                    enabled = !isInvariantCheckEnabled
+                Column(
+                    horizontalAlignment = Alignment.End
                 ) {
-                    Text(
-                        text = if (isInvariantCheckEnabled) {
-                            "Инварианты: включены"
-                        } else {
-                            "Включить инварианты"
-                        }
-                    )
+                    TextButton(
+                        onClick = onEnableInvariantClick,
+                        enabled = !isInvariantCheckEnabled
+                    ) {
+                        Text(
+                            text = if (isInvariantCheckEnabled) {
+                                "Инварианты: включены"
+                            } else {
+                                "Включить инварианты"
+                            }
+                        )
+                    }
+                    TextButton(
+                        onClick = onLoadAvailableToolsClick,
+                        enabled = currentTaskStage == TaskStage.CONVERSATION && !isLoadingAvailableTools
+                    ) {
+                        Text(
+                            text = if (isLoadingAvailableTools) {
+                                "Загрузка tools..."
+                            } else {
+                                "Доступные tools"
+                            }
+                        )
+                    }
                 }
             }
 
@@ -1146,6 +1168,7 @@ private fun ChatScreenPreview() {
                 onOpenInvariantEnableDialog = {},
                 onDismissInvariantEnableDialog = {},
                 onConfirmInvariantEnableDialog = {},
+                onLoadAvailableToolsClick = {},
                 onSystemPromptSelected = {},
                 onUserProfileSelected = {},
                 onOpenCustomProfileBuilder = {},
@@ -1232,6 +1255,7 @@ private fun ChatScreenWithCustomProfileBuilderPreview() {
                 onOpenInvariantEnableDialog = {},
                 onDismissInvariantEnableDialog = {},
                 onConfirmInvariantEnableDialog = {},
+                onLoadAvailableToolsClick = {},
                 onSystemPromptSelected = {},
                 onUserProfileSelected = {},
                 onOpenCustomProfileBuilder = {},

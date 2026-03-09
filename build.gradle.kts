@@ -10,6 +10,7 @@ plugins {
 
 group = "com.pokkerolli.codeagent"
 version = "1.0.0"
+val mcpVersion: String by project
 
 kotlin {
     jvmToolchain(17)
@@ -37,6 +38,7 @@ dependencies {
     implementation("io.ktor:ktor-client-content-negotiation:3.3.1")
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.3.1")
     implementation("io.ktor:ktor-client-logging:3.3.1")
+    implementation("io.modelcontextprotocol:kotlin-sdk-client:$mcpVersion")
 
     implementation("org.slf4j:slf4j-api:2.0.9")
 

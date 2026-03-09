@@ -1,4 +1,5 @@
 package com.pokkerolli.codeagent.data.datasource
+
 import androidx.room.immediateTransaction
 import androidx.room.useWriterConnection
 import com.pokkerolli.codeagent.data.local.dao.MessageDao
@@ -18,6 +19,7 @@ import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionMessage
 import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionRequest
 import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionUsage
 import com.pokkerolli.codeagent.data.remote.dto.StreamOptions
+import com.pokkerolli.codeagent.data.remote.mcp.VkusvillMcpToolsHelper
 import com.pokkerolli.codeagent.data.remote.stream.SseStreamEvent
 import com.pokkerolli.codeagent.data.remote.stream.SseStreamParser
 import com.pokkerolli.codeagent.domain.datasource.ChatDataSource
@@ -61,7 +63,8 @@ class ChatDataSourceImpl(
     private val deepSeekApi: DeepSeekApi,
     private val sseStreamParser: SseStreamParser,
     private val activeSessionPreferences: ActiveSessionPreferences,
-    private val json: Json
+    private val json: Json,
+    private val vkusvillMcpToolsHelper: VkusvillMcpToolsHelper
 ) : ChatDataSource {
 
     private val summarizationMutexBySession = ConcurrentHashMap<String, Mutex>()
@@ -327,11 +330,20 @@ class ChatDataSourceImpl(
                 ),
                 InvariantRuleEntity(
                     ruleKey = INVARIANT_RULE_KEY_FUNCTIONS_UNDER_10_LINES,
-                    title = "Функции короче 10 строк",
-                    description = "Абсолютно все функции в коде должны содержать не более 10 строк (включая пустые строки и комментарии).\n" +
-                            "Перед проверкой сначала пронумеруй все строки внутри функций, включая пустые строки и комментарии, последовательно, начиная с 1.\n" +
-                            "Потом определи start_line и end_line для каждой функции.\n" +
-                            "Только после этого вычисляй line_count. Если line_count > 10, то инвариант нарушен",
+                    title = "Функции не более 10 строк",
+                    description = "Абсолютно все функции в коде должны содержать не более 10 строк.\n" +
+                            "При проверке ограничения “в функции должно быть не более 10 строк” используется следующий способ подсчёта:\n" +
+                            "Найти строку с объявлением функции fun ... {.\n" +
+                            "Найти соответствующую закрывающую фигурную скобку } этой функции.\n" +
+                            "Посчитать все строки между этими двумя строками.\n" +
+                            "Правила подсчёта:\n" +
+                            "Учитываются все строки без исключения, включая:\n" +
+                            "пустые строки\n" +
+                            "строки с комментариями\n" +
+                            "строки, содержащие только { или }\n" +
+                            "Не учитываются:\n" +
+                            "строка с объявлением функции (fun ... {)\n" +
+                            "строка с финальной закрывающей } функции.",
                     position = 2,
                     isActive = true,
                     createdAt = now,
@@ -893,6 +905,31 @@ class ChatDataSourceImpl(
         }
     }
 
+    override suspend fun loadAvailableTools(sessionId: String) {
+        val session = sessionDao.getSessionById(sessionId)
+            ?: throw ChatApiException("Session not found")
+        val stage = TaskStage.fromStored(session.taskStage)
+        if (stage != TaskStage.CONVERSATION) {
+            throw ChatApiException("Кнопка доступна только в режиме conversation.")
+        }
+
+        val toolsMessage = requestMcpToolsMessage()
+        val timestamp = System.currentTimeMillis()
+        database.withTransactionCompat {
+            messageDao.insertMessage(
+                MessageEntity(
+                    sessionId = sessionId,
+                    role = MessageRole.ASSISTANT.name,
+                    taskStage = TaskStage.CONVERSATION.name,
+                    includeInModelContext = false,
+                    content = toolsMessage,
+                    createdAt = timestamp
+                )
+            )
+            sessionDao.touchSession(sessionId, timestamp)
+        }
+    }
+
     override suspend fun requestTaskPause(sessionId: String) {
         val session = sessionDao.getSessionById(sessionId) ?: return
         val stage = TaskStage.fromStored(session.taskStage)
@@ -944,6 +981,10 @@ class ChatDataSourceImpl(
         } catch (cancelled: CancellationException) {
             throw cancelled
         }
+    }
+
+    private suspend fun requestMcpToolsMessage(): String {
+        return vkusvillMcpToolsHelper.requestToolsMessage()
     }
 
     private suspend fun buildUserRequestContextMessages(

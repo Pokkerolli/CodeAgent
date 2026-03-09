@@ -13,6 +13,7 @@ import com.pokkerolli.codeagent.data.local.datastore.ActiveSessionPreferences
 import com.pokkerolli.codeagent.data.local.db.AppDatabase
 import com.pokkerolli.codeagent.data.datasource.ChatDataSourceImpl
 import com.pokkerolli.codeagent.data.remote.api.DeepSeekApi
+import com.pokkerolli.codeagent.data.remote.mcp.VkusvillMcpToolsHelper
 import com.pokkerolli.codeagent.data.remote.stream.SseStreamParser
 import com.pokkerolli.codeagent.domain.datasource.ChatDataSource
 import com.pokkerolli.codeagent.domain.repository.ChatRepository
@@ -21,6 +22,7 @@ import com.pokkerolli.codeagent.domain.usecase.CreateSessionBranchUseCase
 import com.pokkerolli.codeagent.domain.usecase.CreateSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.DeleteSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.GetActiveSessionUseCase
+import com.pokkerolli.codeagent.domain.usecase.LoadAvailableToolsUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveMessagesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveInvariantRulesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveSessionsUseCase
@@ -140,6 +142,7 @@ val networkModule = module {
 
     single { DeepSeekApi(client = get(), baseUrl = AppConfig.DEEPSEEK_BASE_URL) }
     single { SseStreamParser(get()) }
+    single { VkusvillMcpToolsHelper(json = get()) }
 }
 
 val repositoryModule = module {
@@ -153,7 +156,8 @@ val repositoryModule = module {
             deepSeekApi = get(),
             sseStreamParser = get(),
             activeSessionPreferences = get(),
-            json = get()
+            json = get(),
+            vkusvillMcpToolsHelper = get()
         )
     }
 
@@ -180,6 +184,7 @@ val useCaseModule = module {
     factory { StreamUserProfileBuilderReplyUseCase(get()) }
     factory { RunContextSummarizationIfNeededUseCase(get()) }
     factory { GetActiveSessionUseCase(get()) }
+    factory { LoadAvailableToolsUseCase(get()) }
     factory { RequestTaskPauseUseCase(get()) }
     factory { ResumeTaskStreamingUseCase(get()) }
 }
@@ -204,6 +209,7 @@ val viewModelModule = module {
             streamUserProfileBuilderReplyUseCase = get(),
             runContextSummarizationIfNeededUseCase = get(),
             getActiveSessionUseCase = get(),
+            loadAvailableToolsUseCase = get(),
             requestTaskPauseUseCase = get(),
             resumeTaskStreamingUseCase = get()
         )

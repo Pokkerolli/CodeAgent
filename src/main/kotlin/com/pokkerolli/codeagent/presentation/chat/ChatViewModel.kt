@@ -13,6 +13,7 @@ import com.pokkerolli.codeagent.domain.usecase.CreateSessionBranchUseCase
 import com.pokkerolli.codeagent.domain.usecase.CreateSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.DeleteSessionUseCase
 import com.pokkerolli.codeagent.domain.usecase.GetActiveSessionUseCase
+import com.pokkerolli.codeagent.domain.usecase.LoadAvailableToolsUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveInvariantRulesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveMessagesUseCase
 import com.pokkerolli.codeagent.domain.usecase.ObserveUserProfilePresetsUseCase
@@ -57,6 +58,7 @@ class ChatViewModel(
     private val streamUserProfileBuilderReplyUseCase: StreamUserProfileBuilderReplyUseCase,
     private val runContextSummarizationIfNeededUseCase: RunContextSummarizationIfNeededUseCase,
     private val getActiveSessionUseCase: GetActiveSessionUseCase,
+    private val loadAvailableToolsUseCase: LoadAvailableToolsUseCase,
     private val requestTaskPauseUseCase: RequestTaskPauseUseCase,
     private val resumeTaskStreamingUseCase: ResumeTaskStreamingUseCase
 ) : ViewModel() {
@@ -325,6 +327,40 @@ class ChatViewModel(
             }.onFailure { throwable ->
                 _uiState.update {
                     it.copy(errorMessage = throwable.toUiMessage())
+                }
+            }
+        }
+    }
+
+    fun onLoadAvailableToolsClicked() {
+        val state = _uiState.value
+        val sessionId = state.activeSessionId ?: return
+        if (state.isLoadingAvailableTools) return
+        if (state.activeSessionTaskStage != TaskStage.CONVERSATION) {
+            _uiState.update {
+                it.copy(errorMessage = "Кнопка доступна только в режиме conversation.")
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isLoadingAvailableTools = true,
+                    errorMessage = null
+                )
+            }
+            try {
+                loadAvailableToolsUseCase.execute(sessionId).getOrThrow()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (throwable: Throwable) {
+                _uiState.update {
+                    it.copy(errorMessage = throwable.toUiMessage())
+                }
+            } finally {
+                _uiState.update {
+                    it.copy(isLoadingAvailableTools = false)
                 }
             }
         }
