@@ -17,9 +17,16 @@ import com.pokkerolli.codeagent.data.local.mapper.toDomain
 import com.pokkerolli.codeagent.data.remote.api.DeepSeekApi
 import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionMessage
 import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionRequest
+import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionResponseMessage
+import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionTool
+import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionToolFunction
 import com.pokkerolli.codeagent.data.remote.dto.ChatCompletionUsage
 import com.pokkerolli.codeagent.data.remote.dto.StreamOptions
-import com.pokkerolli.codeagent.data.remote.mcp.VkusvillMcpToolsHelper
+import com.pokkerolli.codeagent.data.remote.mcp.McpDiscoveredTool
+import com.pokkerolli.codeagent.data.remote.mcp.McpToolCallResult
+import com.pokkerolli.codeagent.data.remote.mcp.McpToolsHelper
+import com.pokkerolli.codeagent.data.remote.mcp.McpToolsDiscoveryResult
+import com.pokkerolli.codeagent.data.remote.mcp.McpToolsDiscoverySource
 import com.pokkerolli.codeagent.data.remote.stream.SseStreamEvent
 import com.pokkerolli.codeagent.data.remote.stream.SseStreamParser
 import com.pokkerolli.codeagent.domain.datasource.ChatDataSource
@@ -64,7 +71,8 @@ class ChatDataSourceImpl(
     private val sseStreamParser: SseStreamParser,
     private val activeSessionPreferences: ActiveSessionPreferences,
     private val json: Json,
-    private val vkusvillMcpToolsHelper: VkusvillMcpToolsHelper
+    private val mcpToolsHelper: McpToolsHelper,
+    private val mcpStatusMessagesEnabled: Boolean
 ) : ChatDataSource {
 
     private val summarizationMutexBySession = ConcurrentHashMap<String, Mutex>()
@@ -809,42 +817,47 @@ class ChatDataSourceImpl(
                 addAll(contextMessages)
             }
 
-            val request = ChatCompletionRequest(
-                model = DEFAULT_MODEL,
-                messages = requestMessages,
-                stream = true,
-                streamOptions = StreamOptions(includeUsage = true)
-            )
-            var finalAssistantText = ""
-            var finalUsage: ChatCompletionUsage? = null
-
-            val statement = deepSeekApi.prepareStreamChatCompletions(request)
-            statement.execute { response ->
-                val code = response.status.value
-                if (code !in 200..299) {
-                    val rawError = runCatching { response.bodyAsText() }.getOrNull()
-                    throw ChatApiException(buildApiErrorMessage(code = code, rawError = rawError))
-                }
-
-                val responseBody = response.bodyAsChannel()
-                sseStreamParser.streamEvents(responseBody).collect { event ->
-                    when (event) {
-                        is SseStreamEvent.Text -> {
-                            finalAssistantText = event.value
-                            if (finalAssistantText.isNotEmpty()) {
-                                emit(finalAssistantText)
-                            }
-                        }
-
-                        is SseStreamEvent.Usage -> {
-                            finalUsage = event.value
-                        }
-                    }
+            var latestAssistantMessageTimestamp = now
+            suspend fun persistPreFinalMessage(preFinalMessage: ConversationPreFinalMessage) {
+                val messageTimestamp = maxOf(
+                    System.currentTimeMillis(),
+                    latestAssistantMessageTimestamp + 1
+                )
+                latestAssistantMessageTimestamp = messageTimestamp
+                database.withTransactionCompat {
+                    messageDao.insertMessage(
+                        MessageEntity(
+                            sessionId = sessionId,
+                            role = MessageRole.ASSISTANT.name,
+                            taskStage = TaskStage.CONVERSATION.name,
+                            includeInModelContext = preFinalMessage.includeInModelContext,
+                            content = preFinalMessage.content,
+                            createdAt = messageTimestamp
+                        )
+                    )
+                    sessionDao.touchSession(sessionId, messageTimestamp)
                 }
             }
 
+            val conversationReply = requestConversationAssistantReply(
+                requestMessages = requestMessages,
+                onPreFinalMessage = { preFinalMessage ->
+                    persistPreFinalMessage(preFinalMessage)
+                }
+            )
+            val finalAssistantText = conversationReply.text
+            val finalUsage = conversationReply.usage
+
+            if (finalAssistantText.isNotBlank()) {
+                emit(finalAssistantText)
+            }
+
             val promptUsage = resolvePromptUsage(finalUsage)
-            val doneTimestamp = System.currentTimeMillis()
+            val doneTimestamp = maxOf(
+                System.currentTimeMillis(),
+                latestAssistantMessageTimestamp + 1
+            )
+            latestAssistantMessageTimestamp = doneTimestamp
 
             database.withTransactionCompat {
                 if (promptUsage != null && userMessageId > 0L) {
@@ -984,7 +997,370 @@ class ChatDataSourceImpl(
     }
 
     private suspend fun requestMcpToolsMessage(): String {
-        return vkusvillMcpToolsHelper.requestToolsMessage()
+        return mcpToolsHelper.requestToolsMessage()
+    }
+
+    private suspend fun requestConversationAssistantReply(
+        requestMessages: List<ChatCompletionMessage>,
+        onPreFinalMessage: suspend (ConversationPreFinalMessage) -> Unit
+    ): ConversationAssistantReply {
+        val discovery = discoverMcpToolsOrEmpty()
+        val discoveredTools = discovery.tools
+        if (mcpStatusMessagesEnabled) {
+            onPreFinalMessage(
+                buildStatusPreFinalMessage(
+                    content = buildMcpStatusToolsRequested(discovery)
+                )
+            )
+        }
+        if (discoveredTools.isEmpty()) {
+            val completion = requestConversationCompletion(
+                messages = requestMessages,
+                tools = null
+            )
+            return ConversationAssistantReply(
+                text = completion.message.content?.trim().orEmpty(),
+                usage = completion.usage
+            )
+        }
+
+        val toolBindings = mapMcpToolsToLlmTools(discoveredTools)
+        val toolByAlias = toolBindings.associateBy { it.alias }
+        val llmTools = toolBindings.map { it.requestTool }
+        val conversationMessages = requestMessages.toMutableList()
+
+        repeat(MAX_MCP_TOOL_ITERATIONS) { iteration ->
+            val completion = requestConversationCompletion(
+                messages = conversationMessages,
+                tools = llmTools
+            )
+            val modelToolCalls = completion.message.toolCalls.orEmpty()
+            if (modelToolCalls.isEmpty()) {
+                return ConversationAssistantReply(
+                    text = completion.message.content?.trim().orEmpty(),
+                    usage = completion.usage
+                )
+            }
+
+            val intermediateAssistantText = completion.message.content?.trim().orEmpty()
+            if (intermediateAssistantText.isNotEmpty()) {
+                onPreFinalMessage(buildAssistantPreFinalMessage(intermediateAssistantText))
+            }
+
+            conversationMessages.add(
+                ChatCompletionMessage(
+                    role = ASSISTANT_ROLE,
+                    content = completion.message.content,
+                    toolCalls = modelToolCalls
+                )
+            )
+
+            modelToolCalls.forEachIndexed { index, toolCall ->
+                val alias = toolCall.function?.name?.trim().orEmpty()
+                val toolCallId = toolCall.id
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: "tool_call_${iteration + 1}_$index"
+                val selectedTool = toolByAlias[alias]
+                val toolExecution = executeMcpToolCall(
+                    toolByAlias = toolByAlias,
+                    alias = alias,
+                    rawArguments = toolCall.function?.arguments
+                )
+                if (mcpStatusMessagesEnabled) {
+                    onPreFinalMessage(
+                        buildStatusPreFinalMessage(
+                            content = buildMcpStatusToolSelected(
+                                alias = alias,
+                                toolBinding = selectedTool,
+                                toolArguments = toolExecution.argumentsForStatus,
+                                toolResponse = toolExecution.toolOutput
+                            )
+                        )
+                    )
+                }
+                conversationMessages.add(
+                    ChatCompletionMessage(
+                        role = TOOL_ROLE,
+                        content = toolExecution.toolOutput,
+                        name = alias,
+                        toolCallId = toolCallId
+                    )
+                )
+            }
+        }
+
+        val fallbackCompletion = requestConversationCompletion(
+            messages = conversationMessages,
+            tools = llmTools
+        )
+        return ConversationAssistantReply(
+            text = fallbackCompletion.message.content?.trim().orEmpty(),
+            usage = fallbackCompletion.usage
+        )
+    }
+
+    private fun buildStatusPreFinalMessage(content: String): ConversationPreFinalMessage {
+        return ConversationPreFinalMessage(
+            content = content,
+            includeInModelContext = false
+        )
+    }
+
+    private fun buildAssistantPreFinalMessage(content: String): ConversationPreFinalMessage {
+        return ConversationPreFinalMessage(
+            content = content,
+            includeInModelContext = true
+        )
+    }
+
+    private suspend fun requestConversationCompletion(
+        messages: List<ChatCompletionMessage>,
+        tools: List<ChatCompletionTool>?
+    ): ConversationCompletion {
+        val request = ChatCompletionRequest(
+            model = DEFAULT_MODEL,
+            messages = messages,
+            stream = false,
+            tools = tools?.takeIf { it.isNotEmpty() },
+            toolChoice = if (tools.isNullOrEmpty()) null else MCP_TOOL_CHOICE_AUTO
+        )
+        val response = deepSeekApi.chatCompletions(request)
+        val body = response.body
+        if (!response.isSuccessful || body == null) {
+            throw ChatApiException(
+                buildApiErrorMessage(
+                    code = response.code,
+                    rawError = response.rawError
+                )
+            )
+        }
+        val message = body.choices
+            .firstOrNull()
+            ?.message
+            ?: ChatCompletionResponseMessage(
+                role = ASSISTANT_ROLE,
+                content = ""
+            )
+        return ConversationCompletion(
+            message = message,
+            usage = body.usage
+        )
+    }
+
+    private suspend fun discoverMcpToolsOrEmpty(): McpToolsDiscoveryResult {
+        return try {
+            mcpToolsHelper.discoverTools()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            McpToolsDiscoveryResult(
+                tools = emptyList(),
+                source = McpToolsDiscoverySource.MCP
+            )
+        }
+    }
+
+    private fun mapMcpToolsToLlmTools(
+        discoveredTools: List<McpDiscoveredTool>
+    ): List<McpLlmToolBinding> {
+        val usedAliases = mutableSetOf<String>()
+        return discoveredTools.mapIndexed { index, tool ->
+            val baseAlias = buildToolAlias(
+                serverName = tool.server.name,
+                toolName = tool.name,
+                index = index
+            )
+            val alias = allocateUniqueToolAlias(baseAlias, usedAliases)
+            val description = buildToolDescription(tool)
+            McpLlmToolBinding(
+                alias = alias,
+                tool = tool,
+                requestTool = ChatCompletionTool(
+                    type = MCP_TOOL_TYPE_FUNCTION,
+                    function = ChatCompletionToolFunction(
+                        name = alias,
+                        description = description,
+                        parameters = normalizeToolSchema(tool.inputSchema)
+                    )
+                )
+            )
+        }
+    }
+
+    private fun buildToolAlias(
+        serverName: String,
+        toolName: String,
+        index: Int
+    ): String {
+        val serverPart = normalizeToolAliasPart(serverName)
+        val toolPart = normalizeToolAliasPart(toolName)
+        val composed = "${serverPart}__${toolPart}"
+            .trim('_')
+            .take(MCP_TOOL_ALIAS_MAX_LENGTH)
+        return composed.ifBlank { "mcp_tool_${index + 1}" }
+    }
+
+    private fun allocateUniqueToolAlias(
+        baseAlias: String,
+        usedAliases: MutableSet<String>
+    ): String {
+        var alias = baseAlias
+        var counter = 2
+        while (alias in usedAliases || alias.isBlank()) {
+            val suffix = "_$counter"
+            val trimmedBase = baseAlias
+                .take((MCP_TOOL_ALIAS_MAX_LENGTH - suffix.length).coerceAtLeast(1))
+                .ifBlank { "mcp_tool" }
+            alias = trimmedBase + suffix
+            counter += 1
+        }
+        usedAliases += alias
+        return alias
+    }
+
+    private fun normalizeToolAliasPart(value: String): String {
+        return value
+            .trim()
+            .lowercase()
+            .replace(NON_ALPHANUMERIC_UNDERSCORE_REGEX, "_")
+            .replace(MULTIPLE_UNDERSCORE_REGEX, "_")
+            .trim('_')
+            .ifBlank { "tool" }
+    }
+
+    private fun buildToolDescription(tool: McpDiscoveredTool): String {
+        val baseDescription = tool.description
+            ?.trim()
+            ?.ifBlank { null }
+            ?: "MCP tool ${tool.name}"
+        return "$baseDescription (server=${tool.server.name})"
+    }
+
+    private fun normalizeToolSchema(inputSchema: JsonObject?): JsonObject {
+        if (inputSchema == null || inputSchema.isEmpty()) {
+            return defaultToolSchema()
+        }
+        if (inputSchema["type"] != null) {
+            return inputSchema
+        }
+        return buildJsonObject {
+            inputSchema.forEach { (key, value) ->
+                put(key, value)
+            }
+            put("type", JsonPrimitive("object"))
+        }
+    }
+
+    private fun defaultToolSchema(): JsonObject {
+        return buildJsonObject {
+            put("type", JsonPrimitive("object"))
+            put("properties", buildJsonObject { })
+        }
+    }
+
+    private suspend fun executeMcpToolCall(
+        toolByAlias: Map<String, McpLlmToolBinding>,
+        alias: String,
+        rawArguments: String?
+    ): McpToolExecutionOutcome {
+        val binding = toolByAlias[alias]
+        if (binding == null) {
+            return McpToolExecutionOutcome(
+                toolOutput = "MCP tool `$alias` недоступен.",
+                argumentsForStatus = normalizeToolArgumentsForStatus(rawArguments)
+            )
+        }
+        return try {
+            val result = mcpToolsHelper.callTool(
+                tool = binding.tool,
+                rawArguments = rawArguments
+            )
+            McpToolExecutionOutcome(
+                toolOutput = result.output,
+                argumentsForStatus = formatToolCallArguments(result)
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (throwable: Throwable) {
+            val reason = throwable.message?.trim().orEmpty()
+                .ifBlank { "Unknown MCP error" }
+            McpToolExecutionOutcome(
+                toolOutput = "Ошибка вызова MCP tool `${binding.tool.name}` (${binding.tool.server.name}): $reason",
+                argumentsForStatus = normalizeToolArgumentsForStatus(rawArguments)
+            )
+        }
+    }
+
+    private fun buildMcpStatusToolsRequested(
+        discovery: McpToolsDiscoveryResult
+    ): String {
+        val discoveredTools = discovery.tools
+        val total = discoveredTools.size
+        val byServer = discoveredTools
+            .groupBy { it.server.name }
+            .entries
+            .sortedBy { it.key }
+            .joinToString(separator = ", ") { (serverName, tools) ->
+                "$serverName: ${tools.size}"
+            }
+            .ifBlank { "нет доступных tools" }
+        val sourceLabel = when (discovery.source) {
+            McpToolsDiscoverySource.MCP -> "взяли напрямую из MCP"
+            McpToolsDiscoverySource.CACHE -> "взяли из кеша"
+        }
+        return "$MCP_STATUS_PREFIX LLM запросила список tools: $sourceLabel (найдено: $total; $byServer)."
+    }
+
+    private fun buildMcpStatusToolSelected(
+        alias: String,
+        toolBinding: McpLlmToolBinding?,
+        toolArguments: String,
+        toolResponse: String
+    ): String {
+        val normalizedAlias = alias.ifBlank { "<unknown>" }
+        val toolHeadline = if (toolBinding == null) {
+            "$MCP_STATUS_PREFIX LLM решила использовать tool `$normalizedAlias`, но tool не найден."
+        } else {
+            val tool = toolBinding.tool
+            "$MCP_STATUS_PREFIX LLM решила использовать tool `${tool.name}` (сервер: ${tool.server.name})."
+        }
+        val argumentsPreview = trimMcpStatusPayload(
+            payload = toolArguments,
+            maxLength = MCP_STATUS_MAX_ARGUMENTS_LENGTH
+        )
+        val responsePreview = trimMcpStatusPayload(
+            payload = toolResponse,
+            maxLength = MCP_STATUS_MAX_RESPONSE_LENGTH
+        )
+        return buildString {
+            appendLine(toolHeadline)
+            appendLine("Аргументы LLM -> MCP: $argumentsPreview")
+            append("Ответ MCP -> LLM: $responsePreview")
+        }
+    }
+
+    private fun normalizeToolArgumentsForStatus(rawArguments: String?): String {
+        val trimmed = rawArguments?.trim().orEmpty()
+        if (trimmed.isEmpty()) return "{}"
+        return runCatching {
+            json.parseToJsonElement(trimmed).toString()
+        }.getOrElse {
+            trimmed
+        }
+    }
+
+    private fun formatToolCallArguments(result: McpToolCallResult): String {
+        return result.arguments.toString()
+    }
+
+    private fun trimMcpStatusPayload(
+        payload: String,
+        maxLength: Int
+    ): String {
+        val normalized = payload.trim().ifEmpty { "<empty>" }
+        if (normalized.length <= maxLength) return normalized
+        return normalized.take(maxLength) + "... [truncated]"
     }
 
     private suspend fun buildUserRequestContextMessages(
@@ -4266,7 +4642,18 @@ class ChatDataSourceImpl(
         const val DEFAULT_MODEL = "deepseek-chat"
         const val SYSTEM_ROLE = "system"
         const val USER_ROLE = "user"
+        const val ASSISTANT_ROLE = "assistant"
+        const val TOOL_ROLE = "tool"
+        const val MCP_TOOL_CHOICE_AUTO = "auto"
+        const val MCP_TOOL_TYPE_FUNCTION = "function"
+        const val MAX_MCP_TOOL_ITERATIONS = 4
+        const val MCP_TOOL_ALIAS_MAX_LENGTH = 64
+        const val MCP_STATUS_PREFIX = "[MCP STATUS]"
+        const val MCP_STATUS_MAX_ARGUMENTS_LENGTH = 600
+        const val MCP_STATUS_MAX_RESPONSE_LENGTH = 1200
         const val MAX_RAW_ERROR_LENGTH = 240
+        val NON_ALPHANUMERIC_UNDERSCORE_REGEX = Regex("[^a-z0-9_]+")
+        val MULTIPLE_UNDERSCORE_REGEX = Regex("_+")
 
         const val MEMORY_COMMAND_PREFIX = "/memory"
         const val MEMORY_OPERATION_ADD = "add"
@@ -4789,6 +5176,32 @@ private data class PromptUsage(
     val promptTokens: Int,
     val promptCacheHitTokens: Int,
     val promptCacheMissTokens: Int
+)
+
+private data class ConversationCompletion(
+    val message: ChatCompletionResponseMessage,
+    val usage: ChatCompletionUsage?
+)
+
+private data class ConversationAssistantReply(
+    val text: String,
+    val usage: ChatCompletionUsage?
+)
+
+private data class ConversationPreFinalMessage(
+    val content: String,
+    val includeInModelContext: Boolean
+)
+
+private data class McpToolExecutionOutcome(
+    val toolOutput: String,
+    val argumentsForStatus: String
+)
+
+private data class McpLlmToolBinding(
+    val alias: String,
+    val tool: McpDiscoveredTool,
+    val requestTool: ChatCompletionTool
 )
 
 private sealed interface MemoryCommand {

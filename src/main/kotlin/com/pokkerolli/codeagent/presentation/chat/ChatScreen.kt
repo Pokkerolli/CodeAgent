@@ -194,6 +194,7 @@ private fun ChatScreen(
     }
 
     LaunchedEffect(
+        displayMessages.size,
         displayMessages.lastOrNull()?.stableId,
         displayMessages.lastOrNull()?.content,
         state.streamingText,
@@ -272,6 +273,7 @@ private fun ChatScreen(
                     currentTaskStage = state.activeSessionTaskStage,
                     isInvariantCheckEnabled = state.activeSessionInvariantCheckEnabled,
                     isTaskPaused = state.activeSessionTaskPaused,
+                    isMcpStatusMessagesEnabled = state.isMcpStatusMessagesEnabled,
                     isLoadingAvailableTools = state.isLoadingAvailableTools,
                     onTaskPauseResumeClick = onTaskPauseResumeClick,
                     onEnableInvariantClick = onOpenInvariantEnableDialog,
@@ -331,6 +333,7 @@ private fun ConversationUsagePanel(
     currentTaskStage: TaskStage,
     isInvariantCheckEnabled: Boolean,
     isTaskPaused: Boolean,
+    isMcpStatusMessagesEnabled: Boolean,
     isLoadingAvailableTools: Boolean,
     onTaskPauseResumeClick: () -> Unit,
     onEnableInvariantClick: () -> Unit,
@@ -383,6 +386,13 @@ private fun ConversationUsagePanel(
                 Column(
                     horizontalAlignment = Alignment.End
                 ) {
+                    if (isMcpStatusMessagesEnabled) {
+                        Text(
+                            text = "MCP статусы: включены",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                     TextButton(
                         onClick = onEnableInvariantClick,
                         enabled = !isInvariantCheckEnabled
@@ -510,9 +520,12 @@ private fun MessageBubble(
     onCreateBranchClick: (Long) -> Unit
 ) {
     val isUser = message.role == MessageRole.USER
+    val isMcpStatusMessage = message.content.startsWith(MCP_STATUS_PREFIX)
     val bubbleColor = if (message.taskStage == TaskStage.CONVERSATION) {
         if (isUser) {
             MaterialTheme.colorScheme.primaryContainer
+        } else if (isMcpStatusMessage) {
+            MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f)
         } else {
             MaterialTheme.colorScheme.surfaceVariant
         }
@@ -572,7 +585,8 @@ private fun MessageBubble(
                 if (
                     message.role == MessageRole.ASSISTANT &&
                     message.taskStage == TaskStage.CONVERSATION &&
-                    !message.isStreaming
+                    !message.isStreaming &&
+                    !isMcpStatusMessage
                 ) {
                     TextButton(
                         onClick = {
@@ -1080,6 +1094,8 @@ private val CONTEXT_WINDOW_MODE_OPTIONS = listOf(
         label = "Sticky Facts/Key-Value Memory"
     )
 )
+
+private const val MCP_STATUS_PREFIX = "[MCP STATUS]"
 
 @Composable
 private fun ChatScreenPreview() {

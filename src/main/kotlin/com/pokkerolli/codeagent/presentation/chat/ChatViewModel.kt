@@ -2,6 +2,7 @@ package com.pokkerolli.codeagent.presentation.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.pokkerolli.codeagent.config.AppConfig
 import com.pokkerolli.codeagent.domain.model.ChatMessage
 import com.pokkerolli.codeagent.domain.model.ChatSession
 import com.pokkerolli.codeagent.domain.model.ContextWindowMode
@@ -63,7 +64,11 @@ class ChatViewModel(
     private val resumeTaskStreamingUseCase: ResumeTaskStreamingUseCase
 ) : ViewModel() {
 
-    private val _uiState = MutableStateFlow(ChatUiState())
+    private val _uiState = MutableStateFlow(
+        ChatUiState(
+            isMcpStatusMessagesEnabled = AppConfig.MCP_STATUS_MESSAGES_ENABLED
+        )
+    )
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
     private var sessionsCache: List<ChatSession> = emptyList()

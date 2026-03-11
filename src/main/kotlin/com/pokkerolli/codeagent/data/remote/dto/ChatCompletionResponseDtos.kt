@@ -1,5 +1,6 @@
 package com.pokkerolli.codeagent.data.remote.dto
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -16,5 +17,6 @@ data class ChatCompletionResponseChoice(
 @Serializable
 data class ChatCompletionResponseMessage(
     val role: String? = null,
-    val content: String? = null
+    val content: String? = null,
+    @SerialName("tool_calls") val toolCalls: List<ChatCompletionToolCall>? = null
 )

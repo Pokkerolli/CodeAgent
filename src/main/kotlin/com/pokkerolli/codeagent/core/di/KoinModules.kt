@@ -13,7 +13,7 @@ import com.pokkerolli.codeagent.data.local.datastore.ActiveSessionPreferences
 import com.pokkerolli.codeagent.data.local.db.AppDatabase
 import com.pokkerolli.codeagent.data.datasource.ChatDataSourceImpl
 import com.pokkerolli.codeagent.data.remote.api.DeepSeekApi
-import com.pokkerolli.codeagent.data.remote.mcp.VkusvillMcpToolsHelper
+import com.pokkerolli.codeagent.data.remote.mcp.McpToolsHelper
 import com.pokkerolli.codeagent.data.remote.stream.SseStreamParser
 import com.pokkerolli.codeagent.domain.datasource.ChatDataSource
 import com.pokkerolli.codeagent.domain.repository.ChatRepository
@@ -142,7 +142,12 @@ val networkModule = module {
 
     single { DeepSeekApi(client = get(), baseUrl = AppConfig.DEEPSEEK_BASE_URL) }
     single { SseStreamParser(get()) }
-    single { VkusvillMcpToolsHelper(json = get()) }
+    single {
+        McpToolsHelper(
+            json = get(),
+            servers = AppConfig.MCP_SERVERS
+        )
+    }
 }
 
 val repositoryModule = module {
@@ -157,7 +162,8 @@ val repositoryModule = module {
             sseStreamParser = get(),
             activeSessionPreferences = get(),
             json = get(),
-            vkusvillMcpToolsHelper = get()
+            mcpToolsHelper = get(),
+            mcpStatusMessagesEnabled = AppConfig.MCP_STATUS_MESSAGES_ENABLED
         )
     }
 
