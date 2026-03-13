@@ -7,11 +7,13 @@ import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import com.pokkerolli.codeagent.config.AppConfig
 import com.pokkerolli.codeagent.data.local.dao.MessageDao
 import com.pokkerolli.codeagent.data.local.dao.InvariantRuleDao
+import com.pokkerolli.codeagent.data.local.dao.ReminderDeliveryDao
 import com.pokkerolli.codeagent.data.local.dao.SessionDao
 import com.pokkerolli.codeagent.data.local.dao.UserProfilePresetDao
 import com.pokkerolli.codeagent.data.local.datastore.ActiveSessionPreferences
 import com.pokkerolli.codeagent.data.local.db.AppDatabase
 import com.pokkerolli.codeagent.data.datasource.ChatDataSourceImpl
+import com.pokkerolli.codeagent.data.reminder.ReminderDeliveryService
 import com.pokkerolli.codeagent.data.remote.api.DeepSeekApi
 import com.pokkerolli.codeagent.data.remote.mcp.McpToolsHelper
 import com.pokkerolli.codeagent.data.remote.stream.SseStreamParser
@@ -85,7 +87,8 @@ val databaseModule = module {
                 MIGRATION_14_15,
                 MIGRATION_15_16,
                 MIGRATION_16_17,
-                MIGRATION_17_18
+                MIGRATION_17_18,
+                MIGRATION_18_19
             )
             .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
@@ -93,6 +96,7 @@ val databaseModule = module {
 
     single<SessionDao> { get<AppDatabase>().sessionDao() }
     single<MessageDao> { get<AppDatabase>().messageDao() }
+    single<ReminderDeliveryDao> { get<AppDatabase>().reminderDeliveryDao() }
     single<UserProfilePresetDao> { get<AppDatabase>().userProfilePresetDao() }
     single<InvariantRuleDao> { get<AppDatabase>().invariantRuleDao() }
     single { ActiveSessionPreferences() }
@@ -169,6 +173,17 @@ val repositoryModule = module {
 
     single {
         ChatRepository(get())
+    }
+
+    single(createdAtStart = true) {
+        ReminderDeliveryService(
+            database = get(),
+            sessionDao = get(),
+            messageDao = get(),
+            reminderDeliveryDao = get(),
+            mcpToolsHelper = get(),
+            json = get()
+        )
     }
 }
 
@@ -480,6 +495,26 @@ private val MIGRATION_17_18 = object : Migration(17, 18) {
                 $now
             )
             """.trimIndent()
+        )
+    }
+}
+
+private val MIGRATION_18_19 = object : Migration(18, 19) {
+    override fun migrate(connection: SQLiteConnection) {
+        connection.execSql(
+            """
+            CREATE TABLE IF NOT EXISTS reminder_deliveries (
+                reminderId TEXT NOT NULL,
+                sessionId TEXT NOT NULL,
+                chatMessageId INTEGER,
+                deliveredAt INTEGER NOT NULL,
+                PRIMARY KEY(reminderId)
+            )
+            """.trimIndent()
+        )
+        connection.execSql(
+            "CREATE INDEX IF NOT EXISTS index_reminder_deliveries_sessionId " +
+                "ON reminder_deliveries(sessionId)"
         )
     }
 }

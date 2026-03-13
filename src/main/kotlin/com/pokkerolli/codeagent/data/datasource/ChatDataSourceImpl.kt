@@ -57,6 +57,9 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -840,6 +843,8 @@ class ChatDataSourceImpl(
             }
 
             val conversationReply = requestConversationAssistantReply(
+                sessionId = sessionId,
+                userInput = cleanedContent,
                 requestMessages = requestMessages,
                 onPreFinalMessage = { preFinalMessage ->
                     persistPreFinalMessage(preFinalMessage)
@@ -1001,11 +1006,13 @@ class ChatDataSourceImpl(
     }
 
     private suspend fun requestConversationAssistantReply(
+        sessionId: String,
+        userInput: String,
         requestMessages: List<ChatCompletionMessage>,
         onPreFinalMessage: suspend (ConversationPreFinalMessage) -> Unit
     ): ConversationAssistantReply {
         val discovery = discoverMcpToolsOrEmpty()
-        val discoveredTools = discovery.tools
+        val discoveredTools = discovery.tools.filter(::isToolExposedToLlm)
         if (mcpStatusMessagesEnabled) {
             onPreFinalMessage(
                 buildStatusPreFinalMessage(
@@ -1065,7 +1072,9 @@ class ChatDataSourceImpl(
                 val toolExecution = executeMcpToolCall(
                     toolByAlias = toolByAlias,
                     alias = alias,
-                    rawArguments = toolCall.function?.arguments
+                    rawArguments = toolCall.function?.arguments,
+                    sessionId = sessionId,
+                    userMessage = userInput
                 )
                 if (mcpStatusMessagesEnabled) {
                     onPreFinalMessage(
@@ -1165,27 +1174,29 @@ class ChatDataSourceImpl(
         discoveredTools: List<McpDiscoveredTool>
     ): List<McpLlmToolBinding> {
         val usedAliases = mutableSetOf<String>()
-        return discoveredTools.mapIndexed { index, tool ->
-            val baseAlias = buildToolAlias(
-                serverName = tool.server.name,
-                toolName = tool.name,
-                index = index
-            )
-            val alias = allocateUniqueToolAlias(baseAlias, usedAliases)
-            val description = buildToolDescription(tool)
-            McpLlmToolBinding(
-                alias = alias,
-                tool = tool,
-                requestTool = ChatCompletionTool(
-                    type = MCP_TOOL_TYPE_FUNCTION,
-                    function = ChatCompletionToolFunction(
-                        name = alias,
-                        description = description,
-                        parameters = normalizeToolSchema(tool.inputSchema)
+        return discoveredTools
+            .filter(::isToolExposedToLlm)
+            .mapIndexed { index, tool ->
+                val baseAlias = buildToolAlias(
+                    serverName = tool.server.name,
+                    toolName = tool.name,
+                    index = index
+                )
+                val alias = allocateUniqueToolAlias(baseAlias, usedAliases)
+                val description = buildToolDescription(tool)
+                McpLlmToolBinding(
+                    alias = alias,
+                    tool = tool,
+                    requestTool = ChatCompletionTool(
+                        type = MCP_TOOL_TYPE_FUNCTION,
+                        function = ChatCompletionToolFunction(
+                            name = alias,
+                            description = description,
+                            parameters = normalizeToolSchema(tool.inputSchema)
+                        )
                     )
                 )
-            )
-        }
+            }
     }
 
     private fun buildToolAlias(
@@ -1262,7 +1273,9 @@ class ChatDataSourceImpl(
     private suspend fun executeMcpToolCall(
         toolByAlias: Map<String, McpLlmToolBinding>,
         alias: String,
-        rawArguments: String?
+        rawArguments: String?,
+        sessionId: String,
+        userMessage: String
     ): McpToolExecutionOutcome {
         val binding = toolByAlias[alias]
         if (binding == null) {
@@ -1271,10 +1284,16 @@ class ChatDataSourceImpl(
                 argumentsForStatus = normalizeToolArgumentsForStatus(rawArguments)
             )
         }
+        val effectiveArguments = prepareToolArgumentsForExecution(
+            tool = binding.tool,
+            rawArguments = rawArguments,
+            sessionId = sessionId,
+            userMessage = userMessage
+        )
         return try {
             val result = mcpToolsHelper.callTool(
                 tool = binding.tool,
-                rawArguments = rawArguments
+                rawArguments = effectiveArguments
             )
             McpToolExecutionOutcome(
                 toolOutput = result.output,
@@ -1287,15 +1306,70 @@ class ChatDataSourceImpl(
                 .ifBlank { "Unknown MCP error" }
             McpToolExecutionOutcome(
                 toolOutput = "Ошибка вызова MCP tool `${binding.tool.name}` (${binding.tool.server.name}): $reason",
-                argumentsForStatus = normalizeToolArgumentsForStatus(rawArguments)
+                argumentsForStatus = normalizeToolArgumentsForStatus(effectiveArguments)
             )
         }
+    }
+
+    private fun isToolExposedToLlm(tool: McpDiscoveredTool): Boolean {
+        return !isReminderInternalTool(tool)
+    }
+
+    private fun isReminderInternalTool(tool: McpDiscoveredTool): Boolean {
+        return tool.name == REMINDER_TOOL_CLAIM_DUE || tool.name == REMINDER_TOOL_ACKNOWLEDGE
+    }
+
+    private fun prepareToolArgumentsForExecution(
+        tool: McpDiscoveredTool,
+        rawArguments: String?,
+        sessionId: String,
+        userMessage: String
+    ): String? {
+        if (tool.name != REMINDER_TOOL_SCHEDULE) {
+            return rawArguments
+        }
+        val parsedArguments = parseToolArgumentsOrNull(rawArguments) ?: return rawArguments
+        val timezoneId = runCatching { ZoneId.systemDefault().id }
+            .getOrDefault(DEFAULT_RUNTIME_TIMEZONE)
+        val enrichedArguments = buildJsonObject {
+            parsedArguments.forEach { (key, value) ->
+                put(key, value)
+            }
+            if (!parsedArguments.hasNonBlankStringValue("chat_session_id")) {
+                put("chat_session_id", JsonPrimitive(sessionId))
+            }
+            if (!parsedArguments.hasNonBlankStringValue("user_timezone")) {
+                put("user_timezone", JsonPrimitive(timezoneId))
+            }
+            if (!parsedArguments.hasNonBlankStringValue("source_text")) {
+                put("source_text", JsonPrimitive(userMessage))
+            }
+        }
+        return encodeJsonObject(enrichedArguments)
+    }
+
+    private fun parseToolArgumentsOrNull(rawArguments: String?): JsonObject? {
+        val trimmed = rawArguments?.trim().orEmpty()
+        if (trimmed.isEmpty()) {
+            return buildJsonObject { }
+        }
+        return runCatching {
+            json.parseToJsonElement(trimmed) as? JsonObject
+        }.getOrNull()
+    }
+
+    private fun encodeJsonObject(value: JsonObject): String {
+        return json.encodeToString(JsonObject.serializer(), value)
+    }
+
+    private fun JsonObject.hasNonBlankStringValue(key: String): Boolean {
+        return get(key)?.jsonPrimitive?.contentOrNull?.isNotBlank() == true
     }
 
     private fun buildMcpStatusToolsRequested(
         discovery: McpToolsDiscoveryResult
     ): String {
-        val discoveredTools = discovery.tools
+        val discoveredTools = discovery.tools.filter(::isToolExposedToLlm)
         val total = discoveredTools.size
         val byServer = discoveredTools
             .groupBy { it.server.name }
@@ -4345,12 +4419,35 @@ class ChatDataSourceImpl(
         )
         val parts = buildList {
             baseSystemPrompt?.let { add(it) }
+            add(buildRuntimeClockSystemPrompt())
             userProfilePrompt?.let { add(it) }
             add(memoryPrompt)
             add(workTaskPrompt)
             taskSummaryPrompt?.let { add(it) }
         }
         return parts.joinToString(separator = "\n\n")
+    }
+
+    private fun buildRuntimeClockSystemPrompt(): String {
+        val zoneId = ZoneId.systemDefault()
+        val now = ZonedDateTime.now(zoneId)
+        return buildString {
+            append(RUNTIME_CLOCK_SECTION_TITLE)
+            append('\n')
+            append("current_local_datetime=")
+            append(now.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME))
+            append('\n')
+            append("current_local_date=")
+            append(now.toLocalDate())
+            append('\n')
+            append("current_local_time=")
+            append(now.toLocalTime().withNano(0))
+            append('\n')
+            append("timezone=")
+            append(zoneId.id)
+            append('\n')
+            append(RUNTIME_CLOCK_INTERPRETATION_HINT)
+        }
     }
 
     private fun buildUserProfileSystemPrompt(profilePayload: String?): String? {
@@ -4652,6 +4749,10 @@ class ChatDataSourceImpl(
         const val MCP_STATUS_MAX_ARGUMENTS_LENGTH = 600
         const val MCP_STATUS_MAX_RESPONSE_LENGTH = 1200
         const val MAX_RAW_ERROR_LENGTH = 240
+        const val DEFAULT_RUNTIME_TIMEZONE = "UTC"
+        const val REMINDER_TOOL_SCHEDULE = "schedule_reminder"
+        const val REMINDER_TOOL_CLAIM_DUE = "claim_due_reminders"
+        const val REMINDER_TOOL_ACKNOWLEDGE = "acknowledge_reminders"
         val NON_ALPHANUMERIC_UNDERSCORE_REGEX = Regex("[^a-z0-9_]+")
         val MULTIPLE_UNDERSCORE_REGEX = Regex("_+")
 
@@ -4683,6 +4784,12 @@ class ChatDataSourceImpl(
         const val LONG_TERM_MEMORY_EMPTY_HINT = "Инструкции долговременной памяти не заданы."
         const val LONG_TERM_MEMORY_PRIORITY_HINT =
             "Эти правила имеют высший приоритет над всем в контексте, они обязательны к исполнению и не могут быть нарушены. Если нужно нарушить инструкцию, то пользователь явно должен удалить ее, через /memory delete"
+
+        const val RUNTIME_CLOCK_SECTION_TITLE = "[RUNTIME CLOCK]"
+        const val RUNTIME_CLOCK_INTERPRETATION_HINT =
+            "Use these values when interpreting relative dates and times such as " +
+                "\"today\", \"tomorrow\", \"this evening\", or \"in 20 minutes\". " +
+                "For scheduling tools, always convert to an explicit future time."
 
         const val WORK_COMMAND_PREFIX = "/work"
         const val WORK_OPERATION_START = "start"

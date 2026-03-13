@@ -1,4 +1,4 @@
 DEEPSEEK_API_KEY=your_deepseek_api_key
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1/
-MCP_SERVERS=VKUSVILL|https://mcp001.vkusvill.ru/mcp;WEATHER|http://127.0.0.1:3001/mcp
+MCP_SERVERS=VKUSVILL|https://mcp001.vkusvill.ru/mcp;WEATHER|http://127.0.0.1:3001/mcp;REMINDER|http://127.0.0.1:3002/mcp
 MCP_STATUS_MESSAGES=false

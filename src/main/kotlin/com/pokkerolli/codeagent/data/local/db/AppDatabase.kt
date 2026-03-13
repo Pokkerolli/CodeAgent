@@ -4,10 +4,12 @@ import androidx.room.Database
 import androidx.room.RoomDatabase
 import com.pokkerolli.codeagent.data.local.dao.MessageDao
 import com.pokkerolli.codeagent.data.local.dao.InvariantRuleDao
+import com.pokkerolli.codeagent.data.local.dao.ReminderDeliveryDao
 import com.pokkerolli.codeagent.data.local.dao.SessionDao
 import com.pokkerolli.codeagent.data.local.dao.UserProfilePresetDao
 import com.pokkerolli.codeagent.data.local.entity.InvariantRuleEntity
 import com.pokkerolli.codeagent.data.local.entity.MessageEntity
+import com.pokkerolli.codeagent.data.local.entity.ReminderDeliveryEntity
 import com.pokkerolli.codeagent.data.local.entity.SessionEntity
 import com.pokkerolli.codeagent.data.local.entity.UserProfilePresetEntity
 
@@ -15,15 +17,17 @@ import com.pokkerolli.codeagent.data.local.entity.UserProfilePresetEntity
     entities = [
         SessionEntity::class,
         MessageEntity::class,
+        ReminderDeliveryEntity::class,
         UserProfilePresetEntity::class,
         InvariantRuleEntity::class
     ],
-    version = 18,
+    version = 19,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun sessionDao(): SessionDao
     abstract fun messageDao(): MessageDao
+    abstract fun reminderDeliveryDao(): ReminderDeliveryDao
     abstract fun userProfilePresetDao(): UserProfilePresetDao
     abstract fun invariantRuleDao(): InvariantRuleDao
 }

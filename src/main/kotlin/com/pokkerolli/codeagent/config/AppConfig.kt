@@ -7,7 +7,9 @@ import java.util.Properties
 object AppConfig {
     private const val DEFAULT_BASE_URL = "https://api.deepseek.com/v1/"
     private const val DEFAULT_MCP_SERVERS =
-        "VKUSVILL|https://mcp001.vkusvill.ru/mcp;WEATHER|http://127.0.0.1:3001/mcp"
+        "VKUSVILL|https://mcp001.vkusvill.ru/mcp;" +
+            "WEATHER|http://127.0.0.1:3001/mcp;" +
+            "REMINDER|http://127.0.0.1:3002/mcp"
     private const val MCP_STATUS_MESSAGES_KEY = "MCP_STATUS_MESSAGES"
     private const val MCP_SERVERS_KEY = "MCP_SERVERS"
     private const val MCP_DEBUG_MODE_KEY = "MCP_DEBUG_MODE"
