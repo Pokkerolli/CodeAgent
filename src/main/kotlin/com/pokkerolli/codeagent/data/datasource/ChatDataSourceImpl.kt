@@ -1035,6 +1035,10 @@ class ChatDataSourceImpl(
         val toolByAlias = toolBindings.associateBy { it.alias }
         val llmTools = toolBindings.map { it.requestTool }
         val conversationMessages = requestMessages.toMutableList()
+        val reminderToolAlias = toolBindings
+            .firstOrNull { it.tool.name == REMINDER_TOOL_SCHEDULE }
+            ?.alias
+        var reminderToolRetryRequested = false
 
         repeat(MAX_MCP_TOOL_ITERATIONS) { iteration ->
             val completion = requestConversationCompletion(
@@ -1043,6 +1047,20 @@ class ChatDataSourceImpl(
             )
             val modelToolCalls = completion.message.toolCalls.orEmpty()
             if (modelToolCalls.isEmpty()) {
+                if (
+                    !reminderToolRetryRequested &&
+                    reminderToolAlias != null &&
+                    isLikelyReminderRequest(userInput)
+                ) {
+                    reminderToolRetryRequested = true
+                    conversationMessages.add(
+                        ChatCompletionMessage(
+                            role = SYSTEM_ROLE,
+                            content = buildReminderToolRetryPrompt(reminderToolAlias)
+                        )
+                    )
+                    return@repeat
+                }
                 return ConversationAssistantReply(
                     text = completion.message.content?.trim().orEmpty(),
                     usage = completion.usage
@@ -1121,6 +1139,21 @@ class ChatDataSourceImpl(
             content = content,
             includeInModelContext = true
         )
+    }
+
+    private fun isLikelyReminderRequest(userInput: String): Boolean {
+        val normalized = userInput.trim().lowercase()
+        if (normalized.isEmpty()) return false
+        return REMINDER_REQUEST_REGEX.containsMatchIn(normalized)
+    }
+
+    private fun buildReminderToolRetryPrompt(reminderToolAlias: String): String {
+        return """
+            The latest user message is a reminder scheduling request.
+            You must call the tool `$reminderToolAlias` now instead of replying with a plain-text promise.
+            Never claim that a reminder was set unless the tool call succeeds.
+            If the request is too ambiguous to schedule, ask one short clarifying question.
+        """.trimIndent()
     }
 
     private suspend fun requestConversationCompletion(
@@ -4420,6 +4453,7 @@ class ChatDataSourceImpl(
         val parts = buildList {
             baseSystemPrompt?.let { add(it) }
             add(buildRuntimeClockSystemPrompt())
+            add(buildReminderToolPolicyPrompt())
             userProfilePrompt?.let { add(it) }
             add(memoryPrompt)
             add(workTaskPrompt)
@@ -4448,6 +4482,17 @@ class ChatDataSourceImpl(
             append('\n')
             append(RUNTIME_CLOCK_INTERPRETATION_HINT)
         }
+    }
+
+    private fun buildReminderToolPolicyPrompt(): String {
+        return """
+            $REMINDER_POLICY_SECTION_TITLE
+            If the user asks you to remind them later, create an alarm, schedule a reminder, or remind them before an event, you must use the reminder scheduling tool when it is available.
+            Do not simulate reminder creation in plain text.
+            Do not say that a reminder is set unless the tool has been called successfully.
+            For relative phrases like "через 20 минут" or "tomorrow at 3 pm", convert the request into explicit tool arguments.
+            If required scheduling details are missing, ask a short clarifying question.
+        """.trimIndent()
     }
 
     private fun buildUserProfileSystemPrompt(profilePayload: String?): String? {
@@ -4790,6 +4835,11 @@ class ChatDataSourceImpl(
             "Use these values when interpreting relative dates and times such as " +
                 "\"today\", \"tomorrow\", \"this evening\", or \"in 20 minutes\". " +
                 "For scheduling tools, always convert to an explicit future time."
+        const val REMINDER_POLICY_SECTION_TITLE = "[REMINDER TOOL POLICY]"
+        val REMINDER_REQUEST_REGEX = Regex(
+            pattern = "\\b(напомни|напомнить|напоминание|напомнишь|remind\\s+me|set\\s+(me\\s+)?a\\s+reminder|reminder)\\b",
+            options = setOf(RegexOption.IGNORE_CASE)
+        )
 
         const val WORK_COMMAND_PREFIX = "/work"
         const val WORK_OPERATION_START = "start"
